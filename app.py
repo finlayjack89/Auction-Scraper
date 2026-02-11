@@ -1,0 +1,1363 @@
+#!/usr/bin/env python
+"""
+Streamlit UI with live agent progress for the Fast Auction Research CrewAI workflow.
+
+Multi-crew architecture with per-lot token isolation:
+  Phase 1a: Catalog extraction (Scout outputs ALL lots as JSON)
+  Python:   Deterministic keyword filtering
+  Phase 1b: Risk assessment + detail extraction (on filtered lots only)
+  Phase 2:  Per-lot market validation (fresh crew per lot)
+  Phase 3:  Per-lot deep research (fresh crew per lot, top 40% only)
+  Phase 4:  Synthesis — ranking, archive, bidding sheet
+
+Launch with:
+    uv run streamlit run app.py
+"""
+
+import sys
+import os
+import io
+import re
+import json
+import time
+import threading
+from datetime import datetime
+from dataclasses import dataclass, field
+
+# ── Project root & src/ on sys.path ────────────────────────────────────────
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_src_dir = os.path.join(_PROJECT_ROOT, "src")
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+
+try:
+    from dotenv import load_dotenv
+    from crewai import Crew  # noqa: F401
+except ModuleNotFoundError as _e:
+    print(
+        "\n*** ModuleNotFoundError: " + str(_e) + " ***\n"
+        "Please run:  uv run streamlit run app.py\n"
+    )
+    sys.exit(1)
+
+load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
+
+import streamlit as st
+import pandas as pd
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AGENT ROLE MAP
+# ═══════════════════════════════════════════════════════════════════════════
+
+AGENT_ROLE_MAP = {
+    "Scout - Auction Catalog Extractor":                    "Scout",
+    "Scout - Auction Navigator & Keyword Filter":           "Scout",
+    "Risk Officer - Compliance & Filtration Specialist":    "Risk Officer",
+    "Extractor - Item Detail Parser":                       "Extractor",
+    "Market Validator - Rapid Assessment Specialist":       "Market Validator",
+    "Quant - Financial Analysis Specialist":                "Quant",
+    "Archivist - Data Curator & Storage Specialist":        "Archivist",
+    "Deep Research Analyst - Comprehensive Market Intelligence": "Deep Research",
+    "Mobile Report Generator - Bidding Sheet Formatter":    "Report Generator",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PROGRESS TRACKER (thread-safe, phase-aware, allowlist-gated lots)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class LotInfo:
+    lot_num: str
+    title: str = ""
+    keyword: str = ""
+    status: str = "found"          # found | passed | rejected | validating | researching | complete
+    rejection_reason: str = ""
+    stage: str = ""
+    fmv: str = ""
+    margin: str = ""
+    recommendation: str = ""
+
+
+@dataclass
+class Insight:
+    lot: str
+    text: str
+    agent: str = ""
+    timestamp: str = ""
+
+
+class ProgressTracker:
+    """Accumulates execution state; read by the UI polling loop."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+        # Phase tracking
+        self.current_phase: str = "Initializing"
+        self.phase_lot_current: int = 0
+        self.phase_lot_total: int = 0
+        self.phase_step: str = ""
+
+        # Current agent state
+        self.current_agent: str = ""
+        self.current_task_desc: str = ""
+        self.current_thought: str = ""
+        self.current_tool: str = ""
+        self.current_tool_input: str = ""
+
+        # Lot tracking (allowlist-gated)
+        self._known_lots: set[str] = set()
+        self.lots: dict[str, LotInfo] = {}
+
+        # Research insights
+        self.insights: list[Insight] = []
+
+        # Activity log
+        self.log: list[tuple[str, str, str]] = []
+
+        # Final result holder
+        self.finished: bool = False
+        self.result: object = None
+        self.error: Exception | None = None
+
+    # -- helpers ----------------------------------------------------------
+
+    def _ts(self) -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    def add_log(self, agent: str, msg: str):
+        with self._lock:
+            self.log.append((self._ts(), agent, msg))
+
+    def set_agent(self, agent_name: str, task_desc: str = ""):
+        with self._lock:
+            self.current_agent = agent_name
+            if task_desc:
+                self.current_task_desc = task_desc
+            self.current_thought = ""
+            self.current_tool = ""
+            self.current_tool_input = ""
+
+    def set_thought(self, thought: str):
+        with self._lock:
+            self.current_thought = thought
+
+    def set_tool(self, tool: str, tool_input: str = ""):
+        with self._lock:
+            self.current_tool = tool
+            self.current_tool_input = tool_input
+
+    def set_phase(self, phase: str, lot_current: int = 0, lot_total: int = 0, step: str = ""):
+        with self._lock:
+            self.current_phase = phase
+            self.phase_lot_current = lot_current
+            self.phase_lot_total = lot_total
+            self.phase_step = step
+
+    # -- lot helpers (allowlist-gated) ------------------------------------
+
+    def register_filtered_lots(self, lots_data: list[dict]):
+        """Register the canonical set of keyword-filtered lots. Only these can appear in UI."""
+        with self._lock:
+            for lot in lots_data:
+                lot_num = str(lot.get("lot_number", lot.get("lot_num", "")))
+                if not lot_num:
+                    continue
+                self._known_lots.add(lot_num)
+                if lot_num not in self.lots:
+                    self.lots[lot_num] = LotInfo(
+                        lot_num=lot_num,
+                        title=lot.get("title", "")[:80],
+                        status="found",
+                        stage="Filtered",
+                    )
+
+    def update_lot(self, lot_num: str, **kwargs):
+        """Update an existing known lot. Cannot create new lots."""
+        with self._lock:
+            if lot_num not in self._known_lots:
+                return
+            if lot_num not in self.lots:
+                return
+            lot = self.lots[lot_num]
+            for k, v in kwargs.items():
+                if v and hasattr(lot, k):
+                    setattr(lot, k, v)
+
+    def remove_lot(self, lot_num: str, reason: str = ""):
+        """Mark a lot as rejected (Risk Officer removed it)."""
+        with self._lock:
+            if lot_num in self.lots:
+                self.lots[lot_num].status = "rejected"
+                self.lots[lot_num].rejection_reason = reason
+
+    def add_insight(self, lot: str, text: str, agent: str = ""):
+        with self._lock:
+            for existing in self.insights[-20:]:
+                if existing.text[:60] == text[:60]:
+                    return
+            self.insights.append(Insight(lot=lot, text=text, agent=agent, timestamp=self._ts()))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STDOUT INTERCEPTOR (captures agent/tool metadata only — no lot parsing)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class OutputInterceptor(io.TextIOBase):
+    """Wraps sys.stdout to capture CrewAI verbose output for the tracker."""
+
+    ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+    def __init__(self, tracker: ProgressTracker, original):
+        self.tracker = tracker
+        self.original = original
+        self._buffer = ""
+
+    def write(self, text):
+        if self.original:
+            self.original.write(text)
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._process_line(line)
+        return len(text)
+
+    def flush(self):
+        if self.original:
+            self.original.flush()
+
+    @property
+    def encoding(self):
+        return getattr(self.original, 'encoding', 'utf-8')
+
+    def isatty(self):
+        return False
+
+    def _clean(self, text: str) -> str:
+        return self.ANSI_RE.sub('', text).strip()
+
+    def _process_line(self, raw_line: str):
+        line = self._clean(raw_line)
+        if not line:
+            return
+
+        t = self.tracker
+
+        # Detect agent started
+        m = re.match(r'Agent:\s*(.+)', line)
+        if m:
+            role_raw = m.group(1).strip()
+            friendly = AGENT_ROLE_MAP.get(role_raw, role_raw)
+            t.set_agent(friendly)
+            t.add_log(friendly, "Agent activated")
+            return
+
+        # Detect task description
+        m = re.match(r'Task:\s*(.+)', line)
+        if m:
+            with t._lock:
+                t.current_task_desc = m.group(1).strip()[:250]
+            return
+
+        # Detect tool started
+        m = re.match(r'Tool:\s*(\S+)', line)
+        if m:
+            tool_name = m.group(1).strip()
+            t.set_tool(tool_name)
+            t.add_log(t.current_agent, f"Using tool: {tool_name}")
+            return
+
+        # Detect tool args
+        m = re.match(r'Args:\s*(.+)', line)
+        if m:
+            with t._lock:
+                t.current_tool_input = m.group(1).strip()[:300]
+            return
+
+        # NO parse_content here — this was the main leak causing phantom lots
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CALLBACK HANDLERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def make_step_callback(tracker: ProgressTracker):
+    """Returns a step_callback function for a Crew."""
+    from crewai.agents.parser import AgentAction, AgentFinish
+
+    def step_callback(step_output):
+        try:
+            if isinstance(step_output, AgentAction):
+                thought = step_output.thought or ""
+                tool = step_output.tool or ""
+                tool_input = step_output.tool_input or ""
+
+                # Display thought (but suppress parse failure message)
+                if thought and thought != "Failed to parse LLM response":
+                    tracker.set_thought(thought[:500])
+                if tool:
+                    tracker.set_tool(tool, str(tool_input)[:300])
+                    tracker.add_log(tracker.current_agent, f"Tool: {tool}")
+
+                # NO parse_content — prevents phantom lots from tool results
+
+            elif isinstance(step_output, AgentFinish):
+                thought = step_output.thought or ""
+                # Suppress the benign "Failed to parse LLM response" message
+                if thought and thought != "Failed to parse LLM response":
+                    tracker.set_thought(thought[:500])
+                tracker.add_log(tracker.current_agent, "Reached final answer")
+
+        except Exception:
+            pass
+
+    return step_callback
+
+
+def make_task_callback(tracker: ProgressTracker):
+    """Returns a task_callback function for a Crew."""
+
+    def task_callback(task_output):
+        try:
+            agent_role = getattr(task_output, 'agent', '') or ''
+            task_name = getattr(task_output, 'name', '') or ''
+            friendly = AGENT_ROLE_MAP.get(agent_role, agent_role)
+            tracker.add_log(
+                friendly or tracker.current_agent,
+                f"Task completed: {task_name[:80]}"
+            )
+        except Exception:
+            pass
+
+    return task_callback
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PROGRAMMATIC KEYWORD FILTER (deterministic Python — no LLM)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def apply_keyword_filter(
+    lots: list[dict],
+    all_terms: list[str],
+    any_terms: list[str],
+) -> list[dict]:
+    """
+    Deterministic keyword filter applied in Python.
+    Same logic as the UI search builder:
+      - all_terms: lot must contain ALL of these (AND)
+      - any_terms: lot must contain at least ONE of these (OR)
+      - If both are set: must satisfy BOTH conditions
+    """
+    if not all_terms and not any_terms:
+        return lots
+
+    filtered = []
+    for lot in lots:
+        text = f"{lot.get('title', '')} {lot.get('description', '')}".lower()
+
+        # Check ALL (AND) terms
+        if all_terms and not all(t.lower() in text for t in all_terms):
+            continue
+
+        # Check ANY (OR) terms
+        if any_terms and not any(t.lower() in text for t in any_terms):
+            continue
+
+        filtered.append(lot)
+
+    return filtered
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# JSON PARSING HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _extract_json_from_output(raw: str) -> list | dict | None:
+    """Extract JSON from a crew output, handling ```json code fences."""
+    if not raw:
+        return None
+
+    # Try to find JSON inside ```json ... ``` code fence
+    m = re.search(r'```json\s*\n?(.*?)```', raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1).strip())
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Try to find a bare JSON array or object
+    for pattern in [r'(\[.*\])', r'(\{.*\})']:
+        m = re.search(pattern, raw, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # Try the whole string
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    return None
+
+
+def parse_lots_from_output(result) -> list[dict]:
+    """Extract lot array from Scout crew output (Phase 1a)."""
+    raw = getattr(result, "raw", str(result))
+
+    # Try task outputs — the scout catalog is the last task (index 2)
+    task_outputs = getattr(result, "tasks_output", None)
+    if task_outputs and len(task_outputs) >= 3:
+        scout_raw = getattr(task_outputs[2], "raw", "")
+        parsed = _extract_json_from_output(scout_raw)
+        if isinstance(parsed, list):
+            return parsed
+
+    # Fall back to main output
+    parsed = _extract_json_from_output(raw)
+    if isinstance(parsed, list):
+        return parsed
+
+    return []
+
+
+def extract_buyer_premium(result) -> str:
+    """Extract buyer premium data string from Phase 1a output."""
+    task_outputs = getattr(result, "tasks_output", None)
+    if task_outputs and len(task_outputs) >= 2:
+        return getattr(task_outputs[1], "raw", "")
+    return ""
+
+
+def parse_extracted_lots(result) -> list[dict]:
+    """Extract lot array from Phase 1b output (risk + extraction)."""
+    raw = getattr(result, "raw", str(result))
+
+    # Try last task output (extract_item_details)
+    task_outputs = getattr(result, "tasks_output", None)
+    if task_outputs:
+        last_raw = getattr(task_outputs[-1], "raw", "")
+        parsed = _extract_json_from_output(last_raw)
+        if isinstance(parsed, list):
+            return parsed
+
+    parsed = _extract_json_from_output(raw)
+    if isinstance(parsed, list):
+        return parsed
+
+    return []
+
+
+def parse_per_lot_result(result) -> dict:
+    """Extract per-lot result dict from a per-lot crew output."""
+    raw = getattr(result, "raw", str(result))
+
+    # Try last task output
+    task_outputs = getattr(result, "tasks_output", None)
+    if task_outputs:
+        last_raw = getattr(task_outputs[-1], "raw", "")
+        parsed = _extract_json_from_output(last_raw)
+        if isinstance(parsed, dict):
+            return parsed
+
+    parsed = _extract_json_from_output(raw)
+    if isinstance(parsed, dict):
+        return parsed
+
+    # Return a minimal dict with the raw output
+    return {"raw_output": raw}
+
+
+def select_top_lots(validated_lots: list[dict], top_pct: float = 0.4) -> list[dict]:
+    """Rank validated lots by expected profit margin, return top N%."""
+    # Try to sort by expected_profit_margin_pct
+    def get_margin(lot):
+        for key in ["expected_profit_margin_pct", "estimated_profit_margin_percentage", "margin_pct"]:
+            val = lot.get(key)
+            if val is not None:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    pass
+        return -999
+
+    ranked = sorted(validated_lots, key=get_margin, reverse=True)
+
+    # Filter to BUY/MONITOR recommendations only
+    viable = [
+        lot for lot in ranked
+        if lot.get("investment_recommendation", "").upper() in ("BUY", "MONITOR", "")
+    ]
+
+    if not viable:
+        viable = ranked
+
+    # Take top N%
+    n = max(1, int(len(viable) * top_pct))
+    return viable[:n]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UI RENDERING FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def render_pipeline(tracker: ProgressTracker, container):
+    """Render the phase-aware pipeline progress."""
+    with container.container():
+        st.markdown("#### Pipeline Progress")
+
+        phase = tracker.current_phase
+        lot_cur = tracker.phase_lot_current
+        lot_tot = tracker.phase_lot_total
+        step = tracker.phase_step
+
+        if lot_tot > 0:
+            st.markdown(f"**Phase:** {phase}")
+            st.markdown(f"**Progress:** Lot {lot_cur} of {lot_tot}")
+            pct = lot_cur / lot_tot
+            st.progress(pct, text=f"{int(pct * 100)}%")
+        else:
+            st.markdown(f"**Phase:** {phase}")
+            if step:
+                st.markdown(f"**Step:** {step}")
+
+        if tracker.finished:
+            st.markdown("**Status:** Complete")
+
+
+def render_activity(tracker: ProgressTracker, container):
+    """Render the current activity panel."""
+    with container.container():
+        st.markdown("#### Current Activity")
+        agent = tracker.current_agent or "Initializing..."
+        st.markdown(f"**Agent:** {agent}")
+
+        if tracker.current_task_desc:
+            desc = tracker.current_task_desc[:200]
+            st.caption(f"Task: {desc}")
+
+        if tracker.current_tool:
+            st.markdown(f"**Tool:** `{tracker.current_tool}`")
+            if tracker.current_tool_input:
+                inp = tracker.current_tool_input[:200]
+                st.code(inp, language="text")
+
+        if tracker.current_thought:
+            thought = tracker.current_thought[:400]
+            st.info(f"**Agent thinking:** {thought}")
+
+
+def render_lots(tracker: ProgressTracker, container):
+    """Render the live lot tracker table."""
+    with container.container():
+        lots = list(tracker.lots.values())
+        found_count = len(lots)
+        passed_count = sum(1 for lot in lots if lot.status not in ("rejected",))
+        rejected_count = sum(1 for lot in lots if lot.status == "rejected")
+
+        st.markdown(
+            f"#### Lot Tracker &nbsp; ({found_count} filtered &nbsp;|&nbsp; "
+            f"{passed_count} active &nbsp;|&nbsp; {rejected_count} rejected)"
+        )
+
+        if not lots:
+            st.caption("Waiting for catalog extraction and filtering...")
+            return
+
+        rows = []
+        for lot in sorted(lots, key=lambda l: int(l.lot_num) if l.lot_num.isdigit() else 0):
+            if lot.status == "rejected":
+                status_icon = f"rejected: {lot.rejection_reason}"
+            elif lot.recommendation == "BUY":
+                status_icon = "BUY"
+            elif lot.recommendation == "AVOID":
+                status_icon = "AVOID"
+            elif lot.recommendation == "MONITOR":
+                status_icon = "MONITOR"
+            elif lot.status == "complete":
+                status_icon = "Researched"
+            elif lot.status == "researching":
+                status_icon = "Researching..."
+            elif lot.status == "validating":
+                status_icon = "Validating..."
+            elif lot.status == "passed":
+                status_icon = "Passed"
+            else:
+                status_icon = "Filtered"
+
+            rows.append({
+                "Lot": lot.lot_num,
+                "Title": lot.title[:50] if lot.title else "-",
+                "FMV": lot.fmv or "-",
+                "Margin": lot.margin or "-",
+                "Status": status_icon,
+            })
+
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, hide_index=True, height=min(400, 35 * len(rows) + 40))
+
+
+def render_insights(tracker: ProgressTracker, container):
+    """Render research insights panel."""
+    with container.container():
+        st.markdown("#### Research Insights")
+        insights = tracker.insights
+        if not insights:
+            st.caption("Insights will appear as research agents analyze lots...")
+            return
+
+        for ins in reversed(insights[-30:]):
+            lot_tag = f"**Lot {ins.lot}**" if ins.lot and ins.lot != "-" else ""
+            agent_tag = f"`{ins.agent}`" if ins.agent else ""
+            prefix = " - ".join(filter(None, [lot_tag, agent_tag]))
+            st.markdown(f"- {prefix}: {ins.text}")
+
+
+def render_log(tracker: ProgressTracker, container):
+    """Render the scrollable activity log."""
+    with container.container():
+        st.markdown("#### Activity Log")
+        entries = tracker.log
+        if not entries:
+            st.caption("Waiting for activity...")
+            return
+
+        lines = []
+        for ts, agent, msg in entries[-50:]:
+            lines.append(f"`{ts}` **{agent}**: {msg}")
+        st.markdown("\n\n".join(reversed(lines)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SESSION STATE & SEARCH HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _init_session_state():
+    if "any_terms" not in st.session_state:
+        st.session_state.any_terms = []
+    if "all_terms" not in st.session_state:
+        st.session_state.all_terms = []
+
+
+def _add_term(group_key: str, input_key: str):
+    val = st.session_state.get(input_key, "").strip()
+    if val and val.lower() not in [t.lower() for t in st.session_state[group_key]]:
+        st.session_state[group_key].append(val)
+    st.session_state[input_key] = ""
+
+
+def _remove_term(group_key: str, term: str):
+    try:
+        st.session_state[group_key].remove(term)
+    except ValueError:
+        pass
+
+
+def _clear_group(group_key: str):
+    st.session_state[group_key] = []
+
+
+def _render_chips_html(terms: list, bg: str, fg: str) -> str:
+    if not terms:
+        return ""
+    chips = []
+    for t in terms:
+        chips.append(
+            f'<span style="background:{bg};color:{fg};padding:5px 14px;'
+            f'border-radius:20px;margin:3px 4px 3px 0;display:inline-block;'
+            f'font-size:0.9em;font-weight:500;letter-spacing:0.01em;">{t}</span>'
+        )
+    return "".join(chips)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FINAL OUTPUT RENDERING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _try_parse_json(text: str):
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _extract_sources_json(raw_output: str):
+    """Extract the SOURCES_JSON block from the bidding sheet output."""
+    m = re.search(
+        r'<!--\s*SOURCES_JSON_START\s*-->\s*(\[.*?\])\s*<!--\s*SOURCES_JSON_END\s*-->',
+        raw_output,
+        re.DOTALL,
+    )
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return None
+
+
+def render_final_sources(raw_output: str):
+    """Render per-lot, per-platform source dropdowns from the crew output."""
+    sources_data = _extract_sources_json(raw_output)
+    if not sources_data:
+        return
+
+    st.divider()
+    st.subheader("Research Sources by Lot")
+    st.caption(
+        "Expand each lot to see the individual listings that contributed to the "
+        "market value estimate, organised by platform."
+    )
+
+    try:
+        sources_data = sorted(
+            sources_data,
+            key=lambda x: float(x.get("margin_pct", 0) or 0),
+            reverse=True,
+        )
+    except (ValueError, TypeError):
+        pass
+
+    for lot_data in sources_data:
+        lot_num = lot_data.get("lot", "?")
+        lot_title = lot_data.get("title", "Unknown")
+        margin = lot_data.get("margin_pct", "")
+        rec = lot_data.get("recommendation", "")
+        sources = lot_data.get("sources", {})
+
+        if not sources:
+            continue
+
+        margin_str = f" - {margin}% margin" if margin else ""
+        rec_icon = {"BUY": "BUY", "AVOID": "AVOID", "MONITOR": "MONITOR"}.get(str(rec).upper(), "")
+        label = f"Lot {lot_num}: {lot_title}{margin_str} [{rec_icon}]"
+
+        with st.expander(label, expanded=False):
+            platform_names = list(sources.keys())
+            if not platform_names:
+                st.caption("No source data available.")
+                continue
+
+            tabs = st.tabs(platform_names)
+            for tab, platform in zip(tabs, platform_names):
+                with tab:
+                    listings = sources[platform]
+                    if not listings:
+                        st.caption(f"No listings found on {platform}.")
+                        continue
+
+                    rows = []
+                    for item in listings:
+                        row = {
+                            "Title": item.get("title", "-"),
+                            "Sold Price": item.get("sold_price", "-"),
+                        }
+                        if "seller_net" in item and item["seller_net"]:
+                            row["Seller Net"] = item["seller_net"]
+                        if "date" in item and item["date"]:
+                            row["Date"] = item["date"]
+                        if "url" in item and item["url"]:
+                            row["Link"] = item["url"]
+                        rows.append(row)
+
+                    df = pd.DataFrame(rows)
+
+                    if "Link" in df.columns:
+                        df["Link"] = df["Link"].apply(
+                            lambda u: f'<a href="{u}" target="_blank">View</a>'
+                            if u and u != "-" else "-"
+                        )
+                        st.markdown(
+                            df.to_html(escape=False, index=False),
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+
+                    st.caption(f"{len(listings)} listing(s) on {platform}")
+
+
+def render_final_result(raw_output: str):
+    """Show the final crew output in the best format."""
+    parsed = _try_parse_json(raw_output)
+    if parsed is not None:
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            st.subheader("Results (Table)")
+            st.dataframe(pd.DataFrame(parsed), use_container_width=True)
+        else:
+            st.subheader("Results (JSON)")
+            st.json(parsed)
+    else:
+        st.subheader("Results")
+        st.markdown(raw_output)
+
+    with st.expander("Raw output", expanded=False):
+        st.code(raw_output, language="markdown")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STREAMLIT PAGE CONFIG
+# ═══════════════════════════════════════════════════════════════════════════
+
+st.set_page_config(
+    page_title="Fast Auction Research",
+    page_icon="🔨",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+_init_session_state()
+
+# ── Custom CSS ───────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    .hero-title {
+        font-size: 2.4rem; font-weight: 700; line-height: 1.15;
+        margin-bottom: 0.15rem;
+    }
+    .hero-sub {
+        font-size: 1.1rem; color: #777; margin-bottom: 1.6rem; line-height: 1.5;
+    }
+    .filter-card {
+        background: #f8f9fa; border-radius: 12px; padding: 1.25rem 1.4rem;
+        border: 1px solid #e0e0e0;
+    }
+    .filter-card h4 { margin: 0 0 0.25rem 0; font-size: 1.05rem; }
+    .filter-card .desc { font-size: 0.82rem; color: #888; margin-bottom: 0.9rem; }
+    .search-preview {
+        background: #f0f7ff; border-left: 4px solid #1976d2;
+        padding: 0.9rem 1.2rem; border-radius: 0 8px 8px 0;
+        margin: 0.8rem 0 0.4rem 0; font-size: 0.93rem; line-height: 1.6;
+    }
+    .search-preview code {
+        background: #d6e8fa; padding: 2px 6px; border-radius: 4px;
+        font-size: 0.88em;
+    }
+    .step-row { display: flex; gap: 1.2rem; margin: 1.2rem 0 0.4rem 0; }
+    .step-card {
+        flex: 1; background: #fafafa; border: 1px solid #eee;
+        border-radius: 10px; padding: 1rem 1.1rem; text-align: center;
+    }
+    .step-card .num {
+        display: inline-block; background: #1976d2; color: #fff;
+        width: 28px; height: 28px; line-height: 28px; border-radius: 50%;
+        font-weight: 700; font-size: 0.85rem; margin-bottom: 0.4rem;
+    }
+    .step-card .label { font-weight: 600; font-size: 0.95rem; margin-bottom: 0.2rem; }
+    .step-card .detail { font-size: 0.78rem; color: #888; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Sidebar ──────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.subheader("API Key Status")
+    for key in ["GEMINI_API_KEY", "OPENAI_API_KEY", "SERPER_API_KEY",
+                 "FIRECRAWL_API_KEY", "BROWSERBASE_API_KEY"]:
+        icon = "Y" if os.environ.get(key) else "N"
+        st.text(f"{icon}  {key}")
+    st.divider()
+    st.caption("Expand the sidebar to check API key connectivity.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LANDING PAGE
+# ═══════════════════════════════════════════════════════════════════════════
+
+st.markdown(
+    '<p class="hero-title">Fast Auction Research</p>',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    '<p class="hero-sub">'
+    "Paste an auction catalog URL, build your search filters below, and let the "
+    "AI crew scan every lot, validate market prices, and rank profit potential — "
+    "all in one click."
+    "</p>",
+    unsafe_allow_html=True,
+)
+
+st.markdown("""
+<div class="step-row">
+  <div class="step-card">
+    <div class="num">1</div>
+    <div class="label">Extract</div>
+    <div class="detail">Scout scrapes the full catalog; Python filters by your exact keywords</div>
+  </div>
+  <div class="step-card">
+    <div class="num">2</div>
+    <div class="label">Validate</div>
+    <div class="detail">Per-lot market validation with fresh token window for each lot</div>
+  </div>
+  <div class="step-card">
+    <div class="num">3</div>
+    <div class="label">Research</div>
+    <div class="detail">Deep research on top 40% of lots, each with its own context</div>
+  </div>
+  <div class="step-card">
+    <div class="num">4</div>
+    <div class="label">Report</div>
+    <div class="detail">Ranked by profit margin; mobile bidding sheet saved to Box</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("")
+
+# ── Auction URL ──────────────────────────────────────────────────────────
+auction_url = st.text_input(
+    "Auction Catalog URL",
+    placeholder="https://www.example-auction.com/sale/12345",
+    help="Full URL of the auction catalog page to scan.",
+)
+
+st.markdown("---")
+st.markdown("### Search Filters")
+st.caption(
+    "Add terms the crew should look for when scanning lot titles. "
+    "Use **Match ANY** for a broad net and **Must Match ALL** to narrow results."
+)
+
+# ── Two-column filter builder ────────────────────────────────────────────
+col_any, col_all = st.columns(2)
+
+with col_any:
+    st.markdown(
+        '<div class="filter-card">'
+        "<h4>Match ANY of these</h4>"
+        '<div class="desc">A lot is included if it matches <b>at least one</b> of these terms. '
+        "Great for listing multiple brands or categories.</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    inp_col, btn_col = st.columns([5, 1])
+    with inp_col:
+        st.text_input("any_input_label", key="any_input",
+                       placeholder="e.g. Cartier, Rolex, Omega ...",
+                       label_visibility="collapsed")
+    with btn_col:
+        st.button("Add", key="add_any_btn", on_click=_add_term,
+                   args=("any_terms", "any_input"), use_container_width=True)
+
+    if st.session_state.any_terms:
+        st.markdown(
+            _render_chips_html(st.session_state.any_terms, "#e3f2fd", "#1565c0"),
+            unsafe_allow_html=True,
+        )
+        n = len(st.session_state.any_terms)
+        cols_per_row = min(n, 6)
+        rm_cols = st.columns(cols_per_row)
+        for i, term in enumerate(st.session_state.any_terms):
+            rm_cols[i % cols_per_row].button(
+                f"x {term}", key=f"rm_any_{i}",
+                on_click=_remove_term, args=("any_terms", term),
+            )
+        if n > 1:
+            st.button("Clear all", key="clear_any", on_click=_clear_group, args=("any_terms",))
+    else:
+        st.caption("No terms added yet.")
+
+with col_all:
+    st.markdown(
+        '<div class="filter-card">'
+        "<h4>Must match ALL of these</h4>"
+        '<div class="desc">A lot is included <b>only if</b> it contains <b>every one</b> of these terms. '
+        "Use for mandatory attributes like material or type.</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    inp_col2, btn_col2 = st.columns([5, 1])
+    with inp_col2:
+        st.text_input("all_input_label", key="all_input",
+                       placeholder="e.g. gold, 18ct, watch ...",
+                       label_visibility="collapsed")
+    with btn_col2:
+        st.button("Add", key="add_all_btn", on_click=_add_term,
+                   args=("all_terms", "all_input"), use_container_width=True)
+
+    if st.session_state.all_terms:
+        st.markdown(
+            _render_chips_html(st.session_state.all_terms, "#fce4ec", "#c62828"),
+            unsafe_allow_html=True,
+        )
+        n2 = len(st.session_state.all_terms)
+        cols_per_row2 = min(n2, 6)
+        rm_cols2 = st.columns(cols_per_row2)
+        for i, term in enumerate(st.session_state.all_terms):
+            rm_cols2[i % cols_per_row2].button(
+                f"x {term}", key=f"rm_all_{i}",
+                on_click=_remove_term, args=("all_terms", term),
+            )
+        if n2 > 1:
+            st.button("Clear all", key="clear_all", on_click=_clear_group, args=("all_terms",))
+    else:
+        st.caption("No terms added yet.")
+
+# ── Bidding Fee Option ───────────────────────────────────────────────────
+st.markdown("---")
+st.markdown("### Bidding Fee")
+st.caption(
+    "Most online bidding platforms charge a **3% internet surcharge** on top of the hammer price. "
+    "Some allow you to pay a **flat registration fee** instead to avoid the surcharge."
+)
+platform_fee_paid = st.toggle(
+    "I will pay the flat registration fee to avoid the 3% online bidding surcharge",
+    value=False,
+    help="Enable this if you plan to pay the flat fee to register at the auction, "
+         "which removes the per-lot 3% internet surcharge from your cost calculations.",
+)
+
+# ── Live search preview ──────────────────────────────────────────────────
+any_terms = st.session_state.any_terms
+all_terms = st.session_state.all_terms
+has_terms = bool(any_terms or all_terms)
+
+if has_terms:
+    preview_lines = []
+    if any_terms:
+        preview_lines.append(f"<b>Match ANY:</b> {' <code>OR</code> '.join(any_terms)}")
+    if all_terms:
+        preview_lines.append(f"<b>Must have ALL:</b> {' <code>AND</code> '.join(all_terms)}")
+
+    if any_terms and all_terms:
+        logic = f"({' OR '.join(any_terms)}) AND ({' AND '.join(all_terms)})"
+    elif any_terms:
+        logic = " OR ".join(any_terms)
+    else:
+        logic = " AND ".join(all_terms)
+
+    st.markdown(
+        f'<div class="search-preview">'
+        f'{"<br>".join(preview_lines)}<br><br>'
+        f"<b>Combined filter:</b> <code>{logic}</code>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+# ── Start button ─────────────────────────────────────────────────────────
+st.markdown("")
+run_button = st.button(
+    "Start Research Workflow",
+    type="primary",
+    use_container_width=True,
+    disabled=(not auction_url or not has_terms),
+)
+
+if not auction_url and not has_terms:
+    st.caption("Enter an auction URL and add at least one search term to get started.")
+elif not auction_url:
+    st.caption("Enter an auction catalog URL above to enable the workflow.")
+elif not has_terms:
+    st.caption("Add at least one search term to enable the workflow.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WORKFLOW EXECUTION — 4-PHASE MULTI-CREW ORCHESTRATOR
+# ═══════════════════════════════════════════════════════════════════════════
+
+if run_button:
+    platform_fee_choice = "flat_fee_paid" if platform_fee_paid else "3_percent_surcharge"
+    fee_label = "Flat fee paid (no 3% surcharge)" if platform_fee_paid else "3% internet surcharge applies"
+
+    inputs = {
+        "auction_url": auction_url.strip(),
+        "search_keyword": "",  # Not used by Scout anymore
+        "platform_fee_choice": platform_fee_choice,
+    }
+
+    st.info(
+        f"**Auction URL:** {inputs['auction_url']}  \n"
+        f"**Bidding fee:** {fee_label}  \n"
+        f"**ANY terms:** {', '.join(any_terms) if any_terms else 'None'}  \n"
+        f"**ALL terms:** {', '.join(all_terms) if all_terms else 'None'}"
+    )
+
+    # ── Import crews ─────────────────────────────────────────────────────
+    from fast_auction_research___speed_optimized.crew import (
+        ScreeningCrewPartA,
+        ScreeningCrewPartB,
+        PerLotValidationCrew,
+        PerLotDeepResearchCrew,
+        SynthesisCrew,
+    )
+
+    # ── Create tracker & UI containers ───────────────────────────────────
+    tracker = ProgressTracker()
+    tracker.add_log("System", "Starting multi-phase workflow")
+
+    st.divider()
+    col_pipe, col_activity = st.columns([1, 3])
+    with col_pipe:
+        pipeline_ph = st.empty()
+    with col_activity:
+        activity_ph = st.empty()
+
+    lots_ph = st.empty()
+    insights_ph = st.empty()
+    log_ph = st.empty()
+    result_ph = st.empty()
+
+    def _update_ui():
+        render_pipeline(tracker, pipeline_ph)
+        render_activity(tracker, activity_ph)
+        render_lots(tracker, lots_ph)
+        render_insights(tracker, insights_ph)
+        render_log(tracker, log_ph)
+
+    # ── Stdout interceptor ───────────────────────────────────────────────
+    original_stdout = sys.stdout
+    interceptor = OutputInterceptor(tracker, original_stdout)
+    sys.stdout = interceptor
+
+    start_time = time.time()
+
+    try:
+        # ═════════════════════════════════════════════════════════════════
+        # PHASE 1a — Catalog Extraction
+        # ═════════════════════════════════════════════════════════════════
+        tracker.set_phase("Phase 1a: Extracting Catalog", step="Scout scraping all lots...")
+        tracker.add_log("System", "Phase 1a: Starting catalog extraction")
+        _update_ui()
+
+        crew_1a = ScreeningCrewPartA().crew()
+        crew_1a.step_callback = make_step_callback(tracker)
+        crew_1a.task_callback = make_task_callback(tracker)
+
+        result_1a = crew_1a.kickoff(inputs=inputs)
+
+        all_lots = parse_lots_from_output(result_1a)
+        buyer_premium_data = extract_buyer_premium(result_1a)
+
+        tracker.add_log("System", f"Catalog extracted: {len(all_lots)} total lots")
+
+        # ═════════════════════════════════════════════════════════════════
+        # PYTHON KEYWORD FILTER (deterministic)
+        # ═════════════════════════════════════════════════════════════════
+        tracker.set_phase("Keyword Filtering", step="Applying Python filter...")
+        _update_ui()
+
+        filtered_lots = apply_keyword_filter(all_lots, all_terms, any_terms)
+
+        tracker.add_log(
+            "System",
+            f"Python keyword filter: {len(all_lots)} -> {len(filtered_lots)} lots "
+            f"({len(all_lots) - len(filtered_lots)} discarded)"
+        )
+
+        # Register filtered lots in the tracker (this is the canonical lot list)
+        tracker.register_filtered_lots(filtered_lots)
+        _update_ui()
+
+        if not filtered_lots:
+            tracker.finished = True
+            tracker.error = Exception(
+                f"No lots matched your keywords. The catalog had {len(all_lots)} lots "
+                f"but none contained the search terms: "
+                f"ANY={any_terms}, ALL={all_terms}"
+            )
+            _update_ui()
+            sys.stdout = original_stdout
+            elapsed = time.time() - start_time
+            st.error(f"**No matching lots found after {elapsed:.1f}s.**\n\n"
+                     f"The catalog had {len(all_lots)} lots but none matched your keywords.")
+            st.stop()
+
+        # ═════════════════════════════════════════════════════════════════
+        # PHASE 1b — Risk Assessment + Detail Extraction
+        # ═════════════════════════════════════════════════════════════════
+        tracker.set_phase("Phase 1b: Risk Assessment", step=f"Assessing {len(filtered_lots)} lots...")
+        tracker.add_log("System", f"Phase 1b: Risk assessment on {len(filtered_lots)} filtered lots")
+        _update_ui()
+
+        crew_1b = ScreeningCrewPartB().crew()
+        crew_1b.step_callback = make_step_callback(tracker)
+        crew_1b.task_callback = make_task_callback(tracker)
+
+        result_1b = crew_1b.kickoff(inputs={
+            **inputs,
+            "filtered_lots_json": json.dumps(filtered_lots, indent=2),
+        })
+
+        extracted_lots = parse_extracted_lots(result_1b)
+        if not extracted_lots:
+            # Fallback: use filtered_lots directly if parsing failed
+            extracted_lots = filtered_lots
+
+        tracker.add_log("System", f"Phase 1b complete: {len(extracted_lots)} lots passed risk assessment")
+
+        # Update tracker — mark risk-removed lots
+        extracted_nums = {str(l.get("lot_number", l.get("lot_num", ""))) for l in extracted_lots}
+        for lot_num in list(tracker._known_lots):
+            if lot_num not in extracted_nums:
+                tracker.remove_lot(lot_num, "Risk flag")
+            else:
+                tracker.update_lot(lot_num, status="passed", stage="Risk+Extract")
+
+        _update_ui()
+
+        # ═════════════════════════════════════════════════════════════════
+        # PHASE 2 — Per-Lot Market Validation
+        # ═════════════════════════════════════════════════════════════════
+        tracker.set_phase("Phase 2: Market Validation", lot_total=len(extracted_lots))
+        tracker.add_log("System", f"Phase 2: Validating {len(extracted_lots)} lots (one crew per lot)")
+        _update_ui()
+
+        validated_lots = []
+        for i, lot in enumerate(extracted_lots):
+            lot_num = str(lot.get("lot_number", lot.get("lot_num", i + 1)))
+            tracker.set_phase("Phase 2: Market Validation", lot_current=i + 1, lot_total=len(extracted_lots))
+            tracker.update_lot(lot_num, status="validating", stage="Market Validation")
+            tracker.add_log("System", f"Validating lot {lot_num} ({i + 1}/{len(extracted_lots)})")
+            _update_ui()
+
+            try:
+                crew_v = PerLotValidationCrew().crew()
+                crew_v.step_callback = make_step_callback(tracker)
+                crew_v.task_callback = make_task_callback(tracker)
+
+                result_v = crew_v.kickoff(inputs={
+                    "lot_data": json.dumps(lot, indent=2),
+                    "buyer_premium_data": buyer_premium_data,
+                    "platform_fee_choice": platform_fee_choice,
+                })
+
+                lot_result = parse_per_lot_result(result_v)
+                # Ensure lot identifiers are preserved
+                lot_result["lot_number"] = lot_num
+                lot_result["title"] = lot.get("title", "")
+                lot_result["estimate_low"] = lot.get("estimate_low")
+                lot_result["estimate_high"] = lot.get("estimate_high")
+                validated_lots.append(lot_result)
+
+                # Update tracker with results
+                margin = lot_result.get("expected_profit_margin_pct", lot_result.get("estimated_profit_margin_percentage", ""))
+                fmv = lot_result.get("initial_fmv_estimate", "")
+                rec = lot_result.get("investment_recommendation", "")
+                tracker.update_lot(lot_num, status="passed", stage="Validated",
+                                   margin=f"{margin}%" if margin else "",
+                                   fmv=f"£{fmv}" if fmv else "",
+                                   recommendation=rec)
+                if margin:
+                    tracker.add_insight(lot_num, f"Validation margin: {margin}%", "Market Validator")
+
+            except Exception as exc:
+                tracker.add_log("System", f"Lot {lot_num} validation failed: {exc}")
+                tracker.update_lot(lot_num, status="rejected", rejection_reason="Validation failed")
+
+            _update_ui()
+
+        tracker.add_log("System", f"Phase 2 complete: {len(validated_lots)} lots validated")
+
+        # ═════════════════════════════════════════════════════════════════
+        # SELECT TOP 40%
+        # ═════════════════════════════════════════════════════════════════
+        top_lots = select_top_lots(validated_lots, top_pct=0.4)
+        tracker.add_log("System", f"Selected top {len(top_lots)} lots for deep research (40% of {len(validated_lots)})")
+        _update_ui()
+
+        # ═════════════════════════════════════════════════════════════════
+        # PHASE 3 — Per-Lot Deep Research
+        # ═════════════════════════════════════════════════════════════════
+        tracker.set_phase("Phase 3: Deep Research", lot_total=len(top_lots))
+        tracker.add_log("System", f"Phase 3: Deep researching {len(top_lots)} lots (one crew per lot)")
+        _update_ui()
+
+        researched_lots = []
+        for i, lot in enumerate(top_lots):
+            lot_num = str(lot.get("lot_number", lot.get("lot_num", i + 1)))
+            tracker.set_phase("Phase 3: Deep Research", lot_current=i + 1, lot_total=len(top_lots))
+            tracker.update_lot(lot_num, status="researching", stage="Deep Research")
+            tracker.add_log("System", f"Deep researching lot {lot_num} ({i + 1}/{len(top_lots)})")
+            _update_ui()
+
+            try:
+                crew_r = PerLotDeepResearchCrew().crew()
+                crew_r.step_callback = make_step_callback(tracker)
+                crew_r.task_callback = make_task_callback(tracker)
+
+                result_r = crew_r.kickoff(inputs={
+                    "lot_data": json.dumps(lot, indent=2),
+                    "buyer_premium_data": buyer_premium_data,
+                    "platform_fee_choice": platform_fee_choice,
+                })
+
+                lot_result = parse_per_lot_result(result_r)
+                lot_result["lot_number"] = lot_num
+                lot_result["title"] = lot.get("title", "")
+                researched_lots.append(lot_result)
+
+                # Update tracker
+                margin = lot_result.get("expected_profit_margin_pct", "")
+                fmv = lot_result.get("comprehensive_fmv_used", lot_result.get("seller_net_fmv", ""))
+                rec = lot_result.get("final_investment_recommendation", "")
+                tracker.update_lot(lot_num, status="complete", stage="Researched",
+                                   margin=f"{margin}%" if margin else "",
+                                   fmv=f"£{fmv}" if fmv else "",
+                                   recommendation=rec)
+                if margin:
+                    tracker.add_insight(lot_num, f"Deep research margin: {margin}%", "Deep Research")
+
+            except Exception as exc:
+                tracker.add_log("System", f"Lot {lot_num} deep research failed: {exc}")
+                tracker.update_lot(lot_num, status="rejected", rejection_reason="Research failed")
+
+            _update_ui()
+
+        tracker.add_log("System", f"Phase 3 complete: {len(researched_lots)} lots researched")
+
+        # ═════════════════════════════════════════════════════════════════
+        # PHASE 4 — Synthesis
+        # ═════════════════════════════════════════════════════════════════
+        tracker.set_phase("Phase 4: Synthesis", step="Ranking, archiving, generating bidding sheet...")
+        tracker.add_log("System", f"Phase 4: Synthesizing {len(researched_lots)} researched lots")
+        _update_ui()
+
+        crew_s = SynthesisCrew().crew()
+        crew_s.step_callback = make_step_callback(tracker)
+        crew_s.task_callback = make_task_callback(tracker)
+
+        final_result = crew_s.kickoff(inputs={
+            "all_researched_lots": json.dumps(researched_lots, indent=2),
+            "buyer_premium_data": buyer_premium_data,
+            "platform_fee_choice": platform_fee_choice,
+        })
+
+        tracker.finished = True
+        tracker.result = final_result
+        tracker.add_log("System", "Workflow complete!")
+
+    except Exception as exc:
+        tracker.finished = True
+        tracker.error = exc
+        tracker.add_log("System", f"Workflow failed: {exc}")
+
+    finally:
+        sys.stdout = original_stdout
+
+    elapsed = time.time() - start_time
+
+    # ── Final UI render ──────────────────────────────────────────────────
+    _update_ui()
+
+    st.divider()
+    if tracker.error:
+        st.error(f"**Workflow failed after {elapsed:.1f}s:**\n\n```\n{tracker.error}\n```")
+    else:
+        st.success(f"**Workflow finished in {elapsed:.1f} seconds.**")
+        result = tracker.result
+        raw_output = getattr(result, "raw", str(result))
+        render_final_result(raw_output)
+        render_final_sources(raw_output)
+
+        task_outputs = getattr(result, "tasks_output", None)
+        if task_outputs:
+            st.divider()
+            st.subheader("Individual Task Outputs")
+            for i, t_out in enumerate(task_outputs):
+                name = getattr(t_out, "name", None) or getattr(t_out, "description", f"Task {i+1}")
+                label = (str(name)[:100] + "...") if len(str(name)) > 100 else str(name)
+                with st.expander(f"Task {i+1}: {label}", expanded=False):
+                    t_raw = getattr(t_out, "raw", str(t_out))
+                    render_final_result(t_raw)

@@ -1,0 +1,406 @@
+---
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 1a — SCREENING CREW PART A  (extraction + buyer premium)
+# ═══════════════════════════════════════════════════════════════════════════
+
+input_validation_error_handling:
+  description: Perform comprehensive validation of inputs before processing. Test
+    URL accessibility with multiple methods, validate search keyword format (check
+    for proper Boolean operators), inspect site structure to identify auction catalogs
+    vs. error pages. Detect common auction platforms (Christie's, Sotheby's, Heritage,
+    etc.) and provide platform-specific guidance. Report estimated lot count, pagination
+    structure, and any access restrictions (login required, geographic blocks, etc.).
+  expected_output: 'Detailed validation report: {url_status: ''ACCESSIBLE/BLOCKED/ERROR'',
+    platform_detected: ''platform_name'', requires_login: true/false, estimated_lots:
+    number, pagination_detected: true/false, search_keyword_valid: true/false, validation_errors:
+    [], recommendations: []}. Include specific fix recommendations for any issues
+    found.'
+  agent: scout___auction_navigator_keyword_filter
+
+discover_buyer_premium:
+  description: |-
+    **BUYER'S PREMIUM DISCOVERY** - Scrape the auction house website at {auction_url} to find the exact buyer's premium percentage and fee structure.
+
+    **DISCOVERY STRATEGY:**
+    1. **Navigate to Terms of Sale / Buyer's Premium page** on the auction house website
+    2. **Look for links** labelled "Terms", "Conditions of Sale", "Buyer's Premium", "Charges", "Fees" from the auction page
+    3. **Extract the buyer's premium percentage** — this is often tiered (e.g. 25% up to £500,000, then 20% above)
+    4. **Determine if VAT is charged on the premium** (most UK auctions charge VAT on buyer's premium)
+    5. **Identify any additional fees** (Artist Resale Rights / ARR, handling fees, etc.)
+
+    **FALLBACK:** If the buyer's premium cannot be found on the website, default to 25% + VAT (20%) which is the most common UK rate.
+
+    **OUTPUT MUST BE STRUCTURED** so downstream agents can use the exact rates in profit calculations.
+  expected_output: 'Structured buyer premium report: {buyers_premium_rate: "25%",
+    buyers_premium_tiered: true/false, tier_details: [{threshold: "£X", rate: "Y%"}],
+    vat_on_premium: true/false, vat_rate: "20%", additional_fees: [], source_url: "URL
+    where terms were found", discovery_method: "scraped/defaulted"}.'
+  agent: scout___auction_navigator_keyword_filter
+  context:
+  - input_validation_error_handling
+
+scout_auction_catalog:
+  description: |-
+    **BULK CATALOG EXTRACTION** — Scrape the ENTIRE auction catalog and output ALL lots as a JSON array. Do NOT filter. The system will filter automatically after you.
+
+    **EXTRACTION STRATEGY:**
+    1. Use FirecrawlScrapeWebsiteTool to capture entire auction catalog from {auction_url}
+    2. Handle pagination — process ALL catalog pages until every lot is captured
+    3. Parse each lot into a structured JSON object
+
+    **OUTPUT FORMAT — MANDATORY:**
+    Output a JSON array inside a ```json code fence. Every lot in the catalog must be included.
+    Each lot object MUST have these fields:
+    - "lot_number": string (the lot number)
+    - "title": string (the full lot title as listed)
+    - "estimate_low": number or null (low estimate in GBP, no currency symbol)
+    - "estimate_high": number or null (high estimate in GBP, no currency symbol)
+    - "description": string (any additional description text, or empty string)
+
+    **EXAMPLE OUTPUT:**
+    ```json
+    [
+      {"lot_number": "1", "title": "A Cartier Santos wristwatch", "estimate_low": 800, "estimate_high": 1200, "description": "Steel case, blue dial, box and papers"},
+      {"lot_number": "2", "title": "Victorian mahogany table", "estimate_low": 200, "estimate_high": 400, "description": ""}
+    ]
+    ```
+
+    **CRITICAL RULES:**
+    - Output ALL lots — do NOT skip any, do NOT filter
+    - The system applies keyword filtering after you — your job is ONLY extraction
+    - If you cannot parse estimates, use null
+    - Always use a ```json code fence around the array
+  expected_output: "A complete JSON array of ALL lots in the catalog inside a ```json
+    code fence. Each lot has: lot_number, title, estimate_low, estimate_high, description.
+    After the JSON, include a brief note: TOTAL LOTS EXTRACTED: [number]."
+  agent: scout___auction_navigator_keyword_filter
+  context:
+  - input_validation_error_handling
+  - discover_buyer_premium
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 1b — SCREENING CREW PART B  (risk assessment + detail extraction)
+# These tasks receive pre-filtered lots via {filtered_lots_json} input
+# ═══════════════════════════════════════════════════════════════════════════
+
+risk_assessment_filtering:
+  description: |-
+    **RISK ASSESSMENT ON PRE-FILTERED LOTS**
+
+    You are receiving a list of lots that have ALREADY been keyword-filtered by the system.
+    The filtering is done — your job is ONLY risk assessment.
+
+    **PRE-FILTERED LOTS (from system):**
+    {filtered_lots_json}
+
+    **YOUR TASK — RISK ASSESSMENT ONLY:**
+    Apply semantic filtering to detect red flag terms including: 'A/F', 'as found',
+    'sold as seen', 'reproduction', 'replica', 'style of', 'after', 'school of',
+    'spares or repair', 'faux', 'no warranty', 'no guarantee for attribution', 'buyer beware'.
+
+    For each lot, assess risk and mark as:
+    - PASS: No red flags found, safe to proceed
+    - REJECT: Contains red flag terms, remove from pipeline
+    - FLAG: Minor concern but still worth researching (e.g. "slight wear")
+
+    **RULES:**
+    - Do NOT add lots that are not in your input
+    - Do NOT re-apply keyword filtering (already done)
+    - ONLY remove lots with genuine risk flags
+    - Output the surviving lots as a JSON array
+
+    **OUTPUT FORMAT:**
+    Output a JSON array inside a ```json code fence containing ONLY the lots that PASSED risk assessment.
+    Each lot object should include all original fields plus: risk_assessment ("PASS" or "FLAG"), risk_notes.
+  expected_output: 'A JSON array inside a ```json code fence of lots that passed risk
+    assessment. Each lot has all original fields plus risk_assessment and risk_notes.
+    After the JSON, include: RISK REPORT: [received] lots received, [passed] passed,
+    [rejected] rejected, [flagged] flagged.'
+  agent: risk_officer___compliance_filtration_specialist
+
+extract_item_details:
+  description: |-
+    **Process ONLY the risk-assessed lots** passed to you from risk_assessment_filtering.
+    Do NOT add lots that were not in your input.
+
+    For each lot in your input, parse titles and descriptions to identify:
+    brand names, model numbers, materials (gold, silver, stainless steel, leather,
+    etc.), size/dimensions, condition indicators, year/vintage markers, and any special
+    features or attributes. Handle variations in spelling, abbreviations, and auction
+    house terminology. Output clean, standardized data ready for market research.
+
+    **OUTPUT FORMAT:**
+    Output a JSON array inside a ```json code fence. Each lot object should include
+    all original fields plus extracted details.
+
+    **Your output must contain the SAME lots as your input — no additions, no removals.**
+  expected_output: 'A JSON array inside a ```json code fence with extracted details
+    added to each lot: extracted_brand, extracted_model, extracted_materials,
+    extracted_condition, extracted_size, extracted_year, and confidence_scores for
+    each extraction. Lot count must match input.'
+  agent: extractor___item_detail_parser
+  context:
+  - risk_assessment_filtering
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 2 — PER-LOT VALIDATION  (one crew per lot, fresh token window)
+# ═══════════════════════════════════════════════════════════════════════════
+
+per_lot_market_validation:
+  description: |-
+    **MARKET VALIDATION FOR A SINGLE LOT**
+
+    Research this ONE lot and validate its market value:
+    {lot_data}
+
+    **ASSESSMENT METHODOLOGY:**
+    1. **Minimum Data Requirements**:
+       - **5+ SOLD LISTINGS MINIMUM**: Recent sales with prices/dates
+       - **3+ ACTIVE LISTINGS MINIMUM**: Current market pricing
+       - **Only proceed if both minimums met**
+
+    2. **Multi-Platform Search Strategy**:
+       - eBay.co.uk sold listings (primary platform)
+       - eBay.co.uk active listings
+       - Quick searches on Vestiaire Collective, The RealReal
+       - Authentication verification searches
+
+    3. **PLATFORM FEE ADJUSTMENTS FOR FMV CALCULATION:**
+       When recording "sold for" prices, you MUST adjust for seller fees to get realistic resale value:
+       - **Vestiaire Collective**: seller receives ~85% of "sold for" price (12% commission + 3% payment processing)
+       - **eBay (business seller)**: seller receives ~87% of "sold for" price (~12.8% final value fee)
+       - **eBay (private seller)**: seller receives ~100% of "sold for" price (no fees)
+       - **The RealReal**: seller receives ~60% of "sold for" price (40-50% commission)
+       Record BOTH the raw "sold for" price AND the calculated seller_net for each listing.
+       Use the SELLER NET PROCEEDS (not the listed "sold for" price) when calculating FMV.
+
+    4. **Initial Statistical Analysis**:
+       - Calculate mean/median from seller net proceeds (not raw sold prices)
+       - Assess condition variations in pricing
+       - Market activity scoring (volume, recency)
+
+    5. **Profit Potential Assessment**:
+       - Initial FMV estimate based on seller net proceeds from 5+ sales
+       - Quick margin calculation vs auction estimate
+       - Market liquidity assessment
+  expected_output: 'JSON object for this lot with: lot_number, title, initial_sales_data[]
+    (5+ sold listings with platform, sold_price, seller_net_proceeds for each),
+    active_listings_data[] (3+ active listings), initial_market_statistics{mean_seller_net,
+    median_seller_net, price_range}, market_activity_score, initial_fmv_estimate (GBP, based on seller net),
+    estimated_profit_margin_percentage, market_validation_passed (true/false), and
+    comprehensive_research_recommended (true/false).
+    Output inside a ```json code fence.'
+  agent: market_validator___rapid_assessment_specialist
+
+per_lot_profit_calculation:
+  description: |-
+    **PROFIT CALCULATION FOR A SINGLE LOT** — using the market validation data from the previous task.
+
+    **LOT DATA:** {lot_data}
+    **BUYER'S PREMIUM DATA:** {buyer_premium_data}
+    **PLATFORM FEE CHOICE:** {platform_fee_choice}
+
+    **USE ACTUAL BUYER'S PREMIUM** from the buyer_premium_data — do NOT use a hardcoded rate.
+
+    **PLATFORM FEE:**
+    - If "3_percent_surcharge": add 3% of hammer price to acquisition cost
+    - If "flat_fee_paid": do NOT add the 3% surcharge (user paid a flat registration fee)
+
+    **ACQUISITION COST FORMULA:**
+    total_acquisition_cost = HammerPrice × (1 + buyers_premium_rate) × (1 + VAT_rate_on_premium) + platform_fee + Shipping
+
+    **MINIMUM PROFIT THRESHOLD (with 30% margin floor):**
+    max( min(£200, 50% × total_cost), 30% × total_cost )
+
+    **TWO SEPARATE CALCULATIONS (these are DIFFERENT numbers):**
+
+    1. **expected_profit_margin** = (seller_net_FMV - total_cost_at_HIGH_estimate) / total_cost_at_HIGH_estimate × 100
+       - The REAL profit opportunity assuming the lot sells at its HIGH estimate
+
+    2. **max_safe_bid** = the highest hammer price where profit >= threshold
+       - The user's BIDDING CEILING — a safety limit
+
+    Output the complete financial analysis for this single lot.
+  expected_output: 'JSON object for this lot including: lot_number, title,
+    expected_profit_margin_pct, max_safe_bid (GBP), total_acquisition_cost_at_high_estimate,
+    gross_profit_estimate, ROI, profit_confidence_score,
+    fee_breakdown{buyers_premium_rate_used, buyers_premium_amount, vat_on_premium,
+    internet_surcharge, shipping, selling_fees}, min_profit_threshold_used,
+    initial_fmv_estimate, investment_recommendation (BUY/AVOID/MONITOR).
+    Output inside a ```json code fence.'
+  agent: quant___financial_analysis_specialist
+  context:
+  - per_lot_market_validation
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 3 — PER-LOT DEEP RESEARCH  (one crew per lot, fresh token window)
+# ═══════════════════════════════════════════════════════════════════════════
+
+per_lot_deep_research:
+  description: |-
+    **COMPREHENSIVE DEEP MARKET RESEARCH FOR A SINGLE LOT**
+
+    Research this ONE lot exhaustively:
+    {lot_data}
+
+    **RESEARCH METHODOLOGY:**
+
+    1. **Image Matching**: Extract auction images, reverse search across platforms
+    2. **Extensive Data Collection**:
+       - **15+ SALES MINIMUM**: eBay sold, Vestiaire, RealReal, auction houses
+       - **15+ ACTIVE LISTINGS MINIMUM**: Current market comparables
+       - **Exception**: If <15 exist total, analyze ALL available
+
+    3. **PLATFORM FEE ADJUSTMENTS FOR FMV CALCULATION:**
+       When recording "sold for" prices, ALWAYS adjust for seller fees to get realistic resale value:
+       - **Vestiaire Collective**: seller receives ~85% of "sold for" price (12% commission + 3% payment processing)
+       - **eBay (business seller)**: seller receives ~87% of "sold for" price (~12.8% final value fee)
+       - **eBay (private seller)**: seller receives ~100% of "sold for" price (no fees)
+       - **The RealReal**: seller receives ~60% of "sold for" price (40-50% commission)
+       Record BOTH the raw "sold for" price AND the calculated seller_net for each listing.
+       Use the SELLER NET PROCEEDS when calculating comprehensive_market_value_estimate.
+
+    4. **SOURCE TRACKING — MANDATORY:**
+       For EVERY listing found, record: platform name, listing title, sold/asking price, seller_net_proceeds, URL link, and date.
+       Organise sources by platform in the output so they can be displayed to the user.
+
+    5. **Deep Statistical Modeling**:
+       - Condition-adjusted pricing models (using seller net proceeds)
+       - Geographic/seasonal variations
+       - Confidence intervals & outlier analysis
+       - Market liquidity & trend assessment
+  expected_output: 'Comprehensive analysis for this lot: lot_number, title,
+    sources: {"eBay": [{"title": "...", "sold_price": "£X", "seller_net": "£Y", "url": "...", "date": "..."}],
+    "Vestiaire Collective": [...], "The RealReal": [...]},
+    extensive_sales_data[] (15+ sales with seller_net), active_listings_data[] (15+ listings),
+    statistical_analysis, condition_pricing_model,
+    market_liquidity_score, comprehensive_market_value_estimate (GBP, based on seller net proceeds),
+    high_confidence_valuation.
+    Output inside a ```json code fence.'
+  agent: deep_research_analyst___comprehensive_market_intelligence
+
+per_lot_deep_profit:
+  description: |-
+    **FINAL PROFIT ANALYSIS FOR A SINGLE LOT** — using comprehensive deep research data.
+
+    **LOT DATA:** {lot_data}
+    **BUYER'S PREMIUM DATA:** {buyer_premium_data}
+    **PLATFORM FEE CHOICE:** {platform_fee_choice}
+
+    **USE ACTUAL BUYER'S PREMIUM** from the buyer_premium_data — do NOT use a hardcoded rate.
+
+    **PLATFORM FEE:**
+    - If "3_percent_surcharge": add 3% of hammer price to acquisition cost
+    - If "flat_fee_paid": do NOT add the 3% surcharge
+
+    **ACQUISITION COST FORMULA:**
+    total_acquisition_cost = HammerPrice × (1 + buyers_premium_rate) × (1 + VAT_rate_on_premium) + platform_fee + Shipping
+
+    **RESALE VALUE:** Use the comprehensive_market_value_estimate from deep research (seller net proceeds).
+
+    **TWO SEPARATE CALCULATIONS:**
+    1. **expected_profit_margin** = (seller_net_FMV - total_cost_at_HIGH_estimate) / total_cost_at_HIGH_estimate × 100
+    2. **max_safe_bid** = highest hammer price where profit >= max( min(£200, 50% × total_cost), 30% × total_cost )
+
+    **CRITICAL:** Preserve the per-lot "sources" data from deep research for the final report.
+  expected_output: 'JSON object for this lot with: lot_number, title,
+    comprehensive_fmv_used (GBP), seller_net_fmv (GBP),
+    expected_profit_at_high_estimate (GBP), expected_profit_margin_pct,
+    max_safe_bid (GBP), total_acquisition_cost_at_high_estimate, ROI,
+    fee_breakdown, min_profit_threshold_used,
+    final_investment_recommendation (BUY/AVOID/MONITOR), sources{} preserved from deep research.
+    Output inside a ```json code fence.'
+  agent: quant___financial_analysis_specialist
+  context:
+  - per_lot_deep_research
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 4 — SYNTHESIS CREW  (runs once with aggregated results)
+# ═══════════════════════════════════════════════════════════════════════════
+
+synthesis_final_ranking:
+  description: |-
+    **FINAL PROFIT RANKING** — Rank all researched lots by expected_profit_margin descending.
+
+    **ALL RESEARCHED LOTS:**
+    {all_researched_lots}
+
+    **BUYER'S PREMIUM DATA:** {buyer_premium_data}
+
+    **TASKS:**
+    1. Parse all per-lot results
+    2. Sort by expected_profit_margin_pct DESCENDING (most profitable first)
+    3. Assign final BUY/AVOID/MONITOR recommendations
+    4. Preserve ALL per-lot sources{} data
+    5. Calculate summary statistics (total opportunities, total potential profit, etc.)
+
+    Output the ranked list as a JSON array.
+  expected_output: 'JSON array of all lots SORTED BY expected_profit_margin_pct descending,
+    each with: lot_number, title, expected_profit_margin_pct, expected_profit_at_high_estimate,
+    max_safe_bid, total_acquisition_cost, comprehensive_fmv, seller_net_fmv, ROI,
+    fee_breakdown, final_investment_recommendation, sources{}.
+    Output inside a ```json code fence.'
+  agent: quant___financial_analysis_specialist
+
+synthesis_archive:
+  description: |-
+    Process the final ranked opportunities and implement semantic deduplication
+    to prevent duplicate entries. Create structured database records with all collected
+    intelligence: source data, risk assessment, market valuation, financial analysis,
+    and recommendations. Flag any items with expected_profit_margin > 20% for human review queue.
+
+    **IMPORTANT: Preserve the expected_profit_margin ranking order (highest margin first)
+    and the per-lot sources{} data — this data must pass through to the bidding sheet generation.**
+  expected_output: 'Final processed dataset with deduplication report showing:
+    total_items_processed, new_opportunities_identified, duplicates_filtered,
+    high_value_opportunities flagged for review. Output must preserve per-lot sources{}
+    and expected_profit_margin ranking order.'
+  agent: archivist___data_curator_storage_specialist
+  context:
+  - synthesis_final_ranking
+
+synthesis_bidding_sheet:
+  description: |-
+    Transform the processed auction data into a mobile-optimized bidding sheet format AND save it to Box.com.
+
+    **CRITICAL: RANK ALL LOTS BY expected_profit_margin — the REAL opportunity margin at the high estimate. Highest margin first, lowest last.**
+
+    For each viable opportunity, display: lot number, item title, auction estimate range, market value estimate (seller net FMV), expected profit margin at high estimate, max safe bid (bidding ceiling based on max(min(£200, 50%), 30% floor) threshold), and the expected profit in GBP if bought at high estimate.
+
+    Include clear BUY/AVOID/MONITOR recommendations with reasoning.
+
+    **SOURCE DATA:** For each lot, include the research sources organised by platform. Output a JSON structure at the end of the bidding sheet with the following format:
+    ```
+    <!-- SOURCES_JSON_START -->
+    [
+      {
+        "lot": "LOT_NUMBER",
+        "title": "LOT_TITLE",
+        "margin_pct": NUMBER_expected_profit_margin_at_high_estimate,
+        "recommendation": "BUY/AVOID/MONITOR",
+        "sources": {
+          "eBay": [{"title": "...", "sold_price": "...", "url": "..."}],
+          "Vestiaire Collective": [{"title": "...", "sold_price": "...", "url": "..."}],
+          ...
+        }
+      },
+      ...
+    ]
+    <!-- SOURCES_JSON_END -->
+    ```
+
+    Format the main bidding sheet for mobile viewing with clear visual hierarchy, emoji indicators, and essential information prioritised for quick scanning during live auction bidding.
+
+    **IMPORTANT: After generating the bidding sheet, save it to Box.com with filename format: "AUCTION_BIDDING_SHEET_[DATE]_[TIME].md"**
+  expected_output: "Mobile-friendly bidding sheet saved to Box.com as markdown file,
+    with confirmation message including: \"SAVED TO BOX: [filename]\" followed by
+    the bidding sheet content showing: \n\U0001F4F1 AUCTION BIDDING SHEET - [Date]\n\n**RANKED BY EXPECTED PROFIT MARGIN at high estimate (highest first):**\n\nFor
+    each lot:\n\U0001F3AF Lot [NUMBER]: [TITLE] — [EXPECTED_MARGIN]% expected margin\n   \U0001F4B0 Auction Est: £[min]
+    - £[max] \n   \U0001F3EA Market Value (seller net): £[amount]\n   \U0001F4B5 Expected
+    Profit at High Est: £[amount]\n   \n   \U0001F6A7 MAX SAFE BID (ceiling): £[amount]\n
+    \  (based on min profit threshold of £[threshold])\n   \n   \U0001F514 ACTION: [BUY/AVOID/MONITOR]\n
+    \  \U0001F4A1 Note: [brief reason]\n\nFollowed by SOURCES_JSON block.\n\nAt the end, provide
+    a summary count of actionable opportunities and total potential profit."
+  agent: mobile_report_generator___bidding_sheet_formatter
+  context:
+  - synthesis_archive
