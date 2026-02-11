@@ -1054,7 +1054,7 @@ st.set_page_config(
     page_title="Fast Auction Research",
     page_icon="🔨",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 _init_session_state()
@@ -1067,14 +1067,8 @@ st.markdown("""
         margin-bottom: 0.15rem;
     }
     .hero-sub {
-        font-size: 1.1rem; color: #777; margin-bottom: 1.6rem; line-height: 1.5;
+        font-size: 1.05rem; color: #777; margin-bottom: 1.2rem; line-height: 1.5;
     }
-    .filter-card {
-        background: #f8f9fa; border-radius: 12px; padding: 1.25rem 1.4rem;
-        border: 1px solid #e0e0e0;
-    }
-    .filter-card h4 { margin: 0 0 0.25rem 0; font-size: 1.05rem; }
-    .filter-card .desc { font-size: 0.82rem; color: #888; margin-bottom: 0.9rem; }
     .search-preview {
         background: #f0f7ff; border-left: 4px solid #1976d2;
         padding: 0.9rem 1.2rem; border-radius: 0 8px 8px 0;
@@ -1084,18 +1078,23 @@ st.markdown("""
         background: #d6e8fa; padding: 2px 6px; border-radius: 4px;
         font-size: 0.88em;
     }
-    .step-row { display: flex; gap: 1.2rem; margin: 1.2rem 0 0.4rem 0; }
-    .step-card {
-        flex: 1; background: #fafafa; border: 1px solid #eee;
-        border-radius: 10px; padding: 1rem 1.1rem; text-align: center;
+    /* Sidebar How-It-Works steps */
+    .sidebar-step {
+        display: flex; align-items: flex-start; gap: 0.7rem;
+        margin-bottom: 0.75rem;
     }
-    .step-card .num {
-        display: inline-block; background: #1976d2; color: #fff;
-        width: 28px; height: 28px; line-height: 28px; border-radius: 50%;
-        font-weight: 700; font-size: 0.85rem; margin-bottom: 0.4rem;
+    .sidebar-step-num {
+        display: inline-flex; align-items: center; justify-content: center;
+        background: #1976d2; color: #fff; min-width: 24px; height: 24px;
+        border-radius: 50%; font-weight: 700; font-size: 0.78rem;
+        flex-shrink: 0; margin-top: 1px;
     }
-    .step-card .label { font-weight: 600; font-size: 0.95rem; margin-bottom: 0.2rem; }
-    .step-card .detail { font-size: 0.78rem; color: #888; }
+    .sidebar-step-label {
+        font-weight: 600; font-size: 0.9rem; display: block;
+    }
+    .sidebar-step-detail {
+        font-size: 0.76rem; color: #888; display: block; margin-top: 1px;
+    }
     /* Metric styling for summary stats */
     [data-testid="stMetric"] {
         background: #f8f9fa;
@@ -1111,13 +1110,36 @@ st.markdown("""
 
 # ── Sidebar ──────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.subheader("API Key Status")
+    st.markdown("#### How It Works")
+    st.markdown(
+        '<div class="sidebar-step">'
+        '<span class="sidebar-step-num">1</span>'
+        '<div><span class="sidebar-step-label">Extract</span>'
+        '<span class="sidebar-step-detail">Scout scrapes the full catalog; Python filters by your exact keywords</span></div>'
+        '</div>'
+        '<div class="sidebar-step">'
+        '<span class="sidebar-step-num">2</span>'
+        '<div><span class="sidebar-step-label">Validate</span>'
+        '<span class="sidebar-step-detail">Per-lot market validation with fresh token window for each lot</span></div>'
+        '</div>'
+        '<div class="sidebar-step">'
+        '<span class="sidebar-step-num">3</span>'
+        '<div><span class="sidebar-step-label">Research</span>'
+        '<span class="sidebar-step-detail">Deep research on top 40% of lots, each with its own context</span></div>'
+        '</div>'
+        '<div class="sidebar-step">'
+        '<span class="sidebar-step-num">4</span>'
+        '<div><span class="sidebar-step-label">Report</span>'
+        '<span class="sidebar-step-detail">Ranked by profit margin; mobile bidding sheet saved to Box</span></div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.divider()
+    st.markdown("#### API Key Status")
     for key in ["GEMINI_API_KEY", "OPENAI_API_KEY", "SERPER_API_KEY",
                  "FIRECRAWL_API_KEY", "BROWSERBASE_API_KEY"]:
         icon = "Y" if os.environ.get(key) else "N"
         st.text(f"{icon}  {key}")
-    st.divider()
-    st.caption("Expand the sidebar to check API key connectivity.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1130,39 +1152,11 @@ st.markdown(
 )
 st.markdown(
     '<p class="hero-sub">'
-    "Paste an auction catalog URL, build your search filters below, and let the "
-    "AI crew scan every lot, validate market prices, and rank profit potential — "
-    "all in one click."
+    "Paste an auction catalog URL, add your search filters, and let the AI crew "
+    "validate market prices and rank profit potential in one click."
     "</p>",
     unsafe_allow_html=True,
 )
-
-st.markdown("""
-<div class="step-row">
-  <div class="step-card">
-    <div class="num">1</div>
-    <div class="label">Extract</div>
-    <div class="detail">Scout scrapes the full catalog; Python filters by your exact keywords</div>
-  </div>
-  <div class="step-card">
-    <div class="num">2</div>
-    <div class="label">Validate</div>
-    <div class="detail">Per-lot market validation with fresh token window for each lot</div>
-  </div>
-  <div class="step-card">
-    <div class="num">3</div>
-    <div class="label">Research</div>
-    <div class="detail">Deep research on top 40% of lots, each with its own context</div>
-  </div>
-  <div class="step-card">
-    <div class="num">4</div>
-    <div class="label">Report</div>
-    <div class="detail">Ranked by profit margin; mobile bidding sheet saved to Box</div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
-st.markdown("")
 
 # ── Auction URL ──────────────────────────────────────────────────────────
 auction_url = st.text_input(
@@ -1171,17 +1165,10 @@ auction_url = st.text_input(
     help="Full URL of the auction catalog page to scan.",
 )
 
-st.markdown("---")
-st.markdown("### Search Filters")
-st.markdown(
-    '<div class="filter-card">'
-    "<h4>Search Phrases</h4>"
-    '<div class="desc">Enter brands, designers, or item types separated by commas. '
-    "A lot is included if it matches <b>any one</b> of your phrases. "
-    "Multi-word phrases match only if <b>all words</b> appear in the lot "
-    '(e.g. <code>Bottega Veneta</code> matches lots containing both "Bottega" and "Veneta").</div>'
-    "</div>",
-    unsafe_allow_html=True,
+# ── Search Filters ───────────────────────────────────────────────────────
+st.caption(
+    "Add brands, designers, or item types. A lot matches if it contains **any** phrase. "
+    "Multi-word phrases require **all** words to appear."
 )
 
 inp_col, btn_col = st.columns([5, 1])
@@ -1202,7 +1189,7 @@ if st.session_state.phrases:
         unsafe_allow_html=True,
     )
     n = len(st.session_state.phrases)
-    cols_per_row = min(n, 6)
+    cols_per_row = min(n, 8)
     rm_cols = st.columns(cols_per_row)
     for i, phrase in enumerate(st.session_state.phrases):
         rm_cols[i % cols_per_row].button(
@@ -1214,21 +1201,7 @@ if st.session_state.phrases:
 else:
     st.caption("No phrases added yet. Type above and click Add, or enter multiple separated by commas.")
 
-# ── Bidding Fee Option ───────────────────────────────────────────────────
-st.markdown("---")
-st.markdown("### Bidding Fee")
-st.caption(
-    "Most online bidding platforms charge a **3% internet surcharge** on top of the hammer price. "
-    "Some allow you to pay a **flat registration fee** instead to avoid the surcharge."
-)
-platform_fee_paid = st.toggle(
-    "I will pay the flat registration fee to avoid the 3% online bidding surcharge",
-    value=False,
-    help="Enable this if you plan to pay the flat fee to register at the auction, "
-         "which removes the per-lot 3% internet surcharge from your cost calculations.",
-)
-
-# ── Live search preview ──────────────────────────────────────────────────
+# ── Live search preview (directly under chips) ──────────────────────────
 phrases = st.session_state.phrases
 has_terms = bool(phrases)
 
@@ -1250,6 +1223,16 @@ if has_terms:
         f"</div>",
         unsafe_allow_html=True,
     )
+
+# ── Bidding Fee (inline) ────────────────────────────────────────────────
+st.markdown("")
+platform_fee_paid = st.toggle(
+    "I will pay the flat registration fee to avoid the 3% online bidding surcharge",
+    value=False,
+    help="Most platforms charge a 3% internet surcharge. Enable this if you plan to "
+         "pay the flat registration fee instead, removing the per-lot surcharge from "
+         "cost calculations.",
+)
 
 # ── Start button ─────────────────────────────────────────────────────────
 st.markdown("")
@@ -1306,24 +1289,23 @@ if run_button:
     # Pipeline stages bar (full width)
     stages_ph = st.empty()
 
-    # Summary stats row
+    # Summary stats row (full width)
     stats_ph = st.empty()
 
-    # Two-column layout: phase progress + agent activity
-    col_progress, col_agent = st.columns([2, 3])
-    with col_progress:
-        progress_ph = st.empty()
-    with col_agent:
+    # Phase progress + ETA (full width)
+    progress_ph = st.empty()
+
+    # Tabbed dashboard: Agent Activity | Lot Tracker | Insights | Activity Log
+    tab_agent, tab_lots, tab_insights, tab_log = st.tabs([
+        "Agent Activity", "Lot Tracker", "Insights", "Activity Log"
+    ])
+    with tab_agent:
         activity_ph = st.empty()
-
-    # Lot tracker (full width)
-    lots_ph = st.empty()
-
-    # Insights and log side by side
-    col_insights, col_log = st.columns([1, 1])
-    with col_insights:
+    with tab_lots:
+        lots_ph = st.empty()
+    with tab_insights:
         insights_ph = st.empty()
-    with col_log:
+    with tab_log:
         log_ph = st.empty()
 
     result_ph = st.empty()
