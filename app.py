@@ -155,6 +155,13 @@ class ProgressTracker:
         self.total_researched: int = 0
         self.workflow_start: float = 0.0
 
+        # Extraction progress (Phase 1a specific)
+        self.extraction_pages_scraped: int = 0
+        self.extraction_total_pages: int = 0
+        self.extraction_lots_found: int = 0
+        self.extraction_current_page: str = ""
+        self.extraction_last_lot: str = ""
+
     # -- helpers ----------------------------------------------------------
 
     def _ts(self) -> str:
@@ -247,6 +254,13 @@ class ProgressTracker:
                 self.lots[lot_num].status = "rejected"
                 self.lots[lot_num].rejection_reason = reason
 
+    def update_extraction(self, **kwargs):
+        """Update extraction progress fields (Phase 1a)."""
+        with self._lock:
+            for k, v in kwargs.items():
+                if v is not None and hasattr(self, k):
+                    setattr(self, k, v)
+
     def add_insight(self, lot: str, text: str, agent: str = ""):
         with self._lock:
             for existing in self.insights[-20:]:
@@ -311,8 +325,21 @@ class OutputInterceptor(io.TextIOBase):
         # Detect task description
         m = re.match(r'Task:\s*(.+)', line)
         if m:
+            desc = m.group(1).strip()
             with t._lock:
-                t.current_task_desc = m.group(1).strip()[:250]
+                t.current_task_desc = desc[:250]
+            # During Phase 1a, update the sub-step label based on which task is active
+            if t.current_phase == "Phase 1a: Extracting Catalog":
+                desc_lower = desc.lower()
+                if "validation" in desc_lower or "validate" in desc_lower:
+                    with t._lock:
+                        t.phase_step = "Validating auction URL..."
+                elif "buyer" in desc_lower or "premium" in desc_lower:
+                    with t._lock:
+                        t.phase_step = "Discovering buyer premium..."
+                elif "catalog" in desc_lower or "bulk" in desc_lower or "extraction" in desc_lower:
+                    with t._lock:
+                        t.phase_step = "Scraping catalog pages..."
             return
 
         # Detect tool started
@@ -326,11 +353,115 @@ class OutputInterceptor(io.TextIOBase):
         # Detect tool args
         m = re.match(r'Args:\s*(.+)', line)
         if m:
+            args_str = m.group(1).strip()
             with t._lock:
-                t.current_tool_input = m.group(1).strip()[:300]
+                t.current_tool_input = args_str[:300]
+            # During Phase 1a catalog extraction, detect page from URL in tool args
+            if t.current_phase == "Phase 1a: Extracting Catalog" and t.current_tool in _SCRAPING_TOOLS:
+                _parse_extraction_tool(t, t.current_tool, args_str)
             return
 
         # NO parse_content here — this was the main leak causing phantom lots
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EXTRACTION PROGRESS HELPERS (Phase 1a — page & lot detection)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SCRAPING_TOOLS = frozenset({
+    "FirecrawlScrapeWebsiteTool",
+    "ScrapeWebsiteTool",
+    "ScrapeElementFromWebsiteTool",
+    "SerperScrapeWebsiteTool",
+})
+
+
+def _extract_page_from_url(url: str) -> int | None:
+    """Extract page number from common auction pagination URL patterns."""
+    # ?page=N, ?p=N, ?pageNo=N, ?page_no=N
+    m = re.search(r'[?&](?:page|p|pageNo|page_no)=(\d+)', url)
+    if m:
+        return int(m.group(1))
+    # /page/N
+    m = re.search(r'/page/(\d+)', url)
+    if m:
+        return int(m.group(1))
+    # ?offset=N or ?start=N (assume ~60 lots per page)
+    m = re.search(r'[?&](?:offset|start)=(\d+)', url)
+    if m:
+        offset = int(m.group(1))
+        if offset > 0:
+            return (offset // 60) + 1
+    return None
+
+
+def _parse_extraction_tool(tracker: 'ProgressTracker', tool: str, tool_input: str):
+    """Detect page being scraped from a tool call URL during Phase 1a."""
+    if tool not in _SCRAPING_TOOLS:
+        return
+    url_m = re.search(r'https?://[^\s"\'}\]]+', tool_input)
+    if not url_m:
+        return
+    url = url_m.group(0)
+    page = _extract_page_from_url(url)
+    if page is not None:
+        tracker.update_extraction(
+            extraction_current_page=f"Page {page}",
+            extraction_pages_scraped=max(tracker.extraction_pages_scraped, page),
+        )
+        tracker.add_log("Scout", f"Scraping page {page}")
+    elif tracker.extraction_pages_scraped == 0:
+        # First scrape call — no page param means page 1
+        tracker.update_extraction(
+            extraction_current_page="Page 1",
+            extraction_pages_scraped=1,
+        )
+        tracker.add_log("Scout", "Scraping page 1")
+
+
+def _parse_extraction_thought(tracker: 'ProgressTracker', thought: str):
+    """Parse agent thoughts/output during Phase 1a for page & lot counts."""
+    text = thought.lower()
+
+    # "TOTAL LOTS EXTRACTED: 245" or "extracted 120 lots"
+    m = re.search(r'total\s+lots?\s+extracted\s*:\s*(\d+)', text)
+    if m:
+        tracker.update_extraction(extraction_lots_found=int(m.group(1)))
+        return
+
+    # "N lots on page", "N lots from page", "extracted N lots", "found N lots", "parsed N lots"
+    m = re.search(r'(?:extracted|found|parsed|scraped|got)\s+(\d+)\s+lots?', text)
+    if m:
+        count = int(m.group(1))
+        if count > tracker.extraction_lots_found:
+            tracker.update_extraction(extraction_lots_found=count)
+
+    # "N lots" at sentence level (standalone mention of lot count)
+    m = re.search(r'(\d+)\s+lots?\s+(?:total|across|in total|altogether|so far)', text)
+    if m:
+        count = int(m.group(1))
+        if count > tracker.extraction_lots_found:
+            tracker.update_extraction(extraction_lots_found=count)
+
+    # "page N of M"
+    m = re.search(r'page\s+(\d+)\s+of\s+(\d+)', text)
+    if m:
+        page_num = int(m.group(1))
+        total_pages = int(m.group(2))
+        tracker.update_extraction(
+            extraction_current_page=f"Page {page_num}",
+            extraction_pages_scraped=max(tracker.extraction_pages_scraped, page_num),
+            extraction_total_pages=max(tracker.extraction_total_pages, total_pages),
+        )
+
+    # "M pages total" or "total of M pages"
+    m = re.search(r'(\d+)\s+pages?\s+(?:total|in total)', text)
+    if m:
+        tracker.update_extraction(extraction_total_pages=int(m.group(1)))
+
+    # Detect last lot seen: "lot 45", "lot number 45"
+    for lot_m in re.finditer(r'lot\s+(?:number\s+)?(\d+)', text):
+        tracker.update_extraction(extraction_last_lot=f"Lot {lot_m.group(1)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -343,6 +474,8 @@ def make_step_callback(tracker: ProgressTracker):
 
     def step_callback(step_output):
         try:
+            is_extraction = (tracker.current_phase == "Phase 1a: Extracting Catalog")
+
             if isinstance(step_output, AgentAction):
                 thought = step_output.thought or ""
                 tool = step_output.tool or ""
@@ -351,9 +484,15 @@ def make_step_callback(tracker: ProgressTracker):
                 # Display thought (but suppress parse failure message)
                 if thought and thought != "Failed to parse LLM response":
                     tracker.set_thought(thought[:500])
+                    # During extraction, parse thoughts for page/lot info
+                    if is_extraction:
+                        _parse_extraction_thought(tracker, thought)
                 if tool:
                     tracker.set_tool(tool, str(tool_input)[:300])
                     tracker.add_log(tracker.current_agent, f"Tool: {tool}")
+                    # During extraction, parse scraping tool URLs for page info
+                    if is_extraction:
+                        _parse_extraction_tool(tracker, tool, str(tool_input))
 
                 # NO parse_content — prevents phantom lots from tool results
 
@@ -362,6 +501,9 @@ def make_step_callback(tracker: ProgressTracker):
                 # Suppress the benign "Failed to parse LLM response" message
                 if thought and thought != "Failed to parse LLM response":
                     tracker.set_thought(thought[:500])
+                    # During extraction, parse final answer for lot/page info
+                    if is_extraction:
+                        _parse_extraction_thought(tracker, thought)
                 tracker.add_log(tracker.current_agent, "Reached final answer")
 
         except Exception:
@@ -382,6 +524,18 @@ def make_task_callback(tracker: ProgressTracker):
                 friendly or tracker.current_agent,
                 f"Task completed: {task_name[:80]}"
             )
+
+            # During Phase 1a, extract pagination info from validation task output
+            if tracker.current_phase == "Phase 1a: Extracting Catalog":
+                raw = getattr(task_output, 'raw', '') or ''
+                # estimated_total_pages from the validation task
+                m = re.search(r'estimated_total_pages\s*:\s*(\d+)', raw)
+                if m:
+                    tracker.update_extraction(extraction_total_pages=int(m.group(1)))
+                # estimated total lots
+                m = re.search(r'estimated_lots\s*:\s*(\d+)', raw)
+                if m:
+                    tracker.add_log("Scout", f"Auction reports ~{m.group(1)} total lots")
         except Exception:
             pass
 
@@ -698,7 +852,10 @@ def render_phase_progress(tracker: ProgressTracker, container):
         if elapsed_str:
             st.caption(f"Elapsed: {elapsed_str}")
 
-        if lot_tot > 0:
+        # Extraction-specific progress during Phase 1a
+        if phase == "Phase 1a: Extracting Catalog":
+            _render_extraction_progress(tracker)
+        elif lot_tot > 0:
             # Show lot-level progress with progress bar
             pct = lot_cur / lot_tot
             eta = _fmt_eta(tracker.get_eta_seconds())
@@ -715,6 +872,49 @@ def render_phase_progress(tracker: ProgressTracker, container):
                 st.error("Workflow failed")
             else:
                 st.success("Workflow complete")
+
+
+def _render_extraction_progress(tracker: ProgressTracker):
+    """Render extraction-specific progress during Phase 1a."""
+    pages = tracker.extraction_pages_scraped
+    total_pages = tracker.extraction_total_pages
+    lots_found = tracker.extraction_lots_found
+    current_page = tracker.extraction_current_page
+    last_lot = tracker.extraction_last_lot
+    step = tracker.phase_step
+
+    # If we have page/lot data, show the rich extraction indicator
+    if pages > 0 or lots_found > 0:
+        # Build the status parts
+        parts = []
+        if current_page:
+            if total_pages > 0:
+                parts.append(f"Scraping {current_page} of ~{total_pages}")
+            else:
+                parts.append(f"Scraping {current_page}")
+        if lots_found > 0:
+            parts.append(f"{lots_found} lots found")
+        if last_lot:
+            parts.append(f"Last seen: {last_lot}")
+
+        progress_text = "  \u00b7  ".join(parts) if parts else "Extracting catalog..."
+
+        # Show a progress bar if we know total pages
+        if total_pages > 0 and pages > 0:
+            pct = min(pages / total_pages, 1.0)
+            st.progress(pct, text=progress_text)
+        else:
+            # Show an indeterminate-style status
+            extraction_html = (
+                f'<div style="background:#e8f5e9;border-left:4px solid #43a047;'
+                f'padding:10px 14px;border-radius:0 8px 8px 0;font-size:0.9rem;">'
+                f'{progress_text}</div>'
+            )
+            st.markdown(extraction_html, unsafe_allow_html=True)
+    else:
+        # Before scraping starts, show the sub-step (validation, buyer premium, etc.)
+        if step:
+            st.markdown(f"*{step}*")
 
 
 def render_agent_activity(tracker: ProgressTracker, container):
@@ -1360,6 +1560,14 @@ if run_button:
             f"Python keyword filter: {len(all_lots)} -> {len(filtered_lots)} lots "
             f"({len(all_lots) - len(filtered_lots)} discarded)"
         )
+
+        # Log per-phrase match breakdown so the user can see which terms hit
+        for phrase in phrases:
+            count = sum(
+                1 for lot in all_lots
+                if _phrase_matches(phrase, f"{lot.get('title', '')} {lot.get('description', '')}".lower())
+            )
+            tracker.add_log("Filter", f'"{phrase}" matched {count} of {len(all_lots)} lots')
 
         # Register filtered lots in the tracker (this is the canonical lot list)
         tracker.register_filtered_lots(filtered_lots)
