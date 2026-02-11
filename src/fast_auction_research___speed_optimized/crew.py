@@ -9,8 +9,6 @@ Multi-crew architecture for Fast Auction Research.
   - SynthesisCrew: Final ranking, archive, bidding sheet
 """
 
-import os
-
 from crewai import LLM
 from crewai import Agent, Crew, Process, Task
 from crewai.project import CrewBase, agent, crew, task
@@ -25,118 +23,13 @@ from crewai_tools import (
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SHARED AGENT FACTORIES  (used by multiple crews)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _make_scout() -> Agent:
-    return Agent(
-        config="scout___auction_navigator_keyword_filter",
-        tools=[
-            ScrapeWebsiteTool(),
-            SerperScrapeWebsiteTool(),
-            ScrapeElementFromWebsiteTool(),
-        ],
-        reasoning=False,
-        inject_date=True,
-        allow_delegation=False,
-        max_iter=25,
-        llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.4),
-    )
-
-
-def _make_risk_officer() -> Agent:
-    return Agent(
-        config="risk_officer___compliance_filtration_specialist",
-        tools=[],
-        reasoning=False,
-        inject_date=True,
-        allow_delegation=False,
-        max_iter=25,
-        llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.1),
-    )
-
-
-def _make_extractor() -> Agent:
-    return Agent(
-        config="extractor___item_detail_parser",
-        tools=[],
-        reasoning=False,
-        inject_date=True,
-        allow_delegation=False,
-        max_iter=25,
-        llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.1),
-    )
-
-
-def _make_market_validator() -> Agent:
-    return Agent(
-        config="market_validator___rapid_assessment_specialist",
-        tools=[SerperDevTool(), FirecrawlScrapeWebsiteTool()],
-        reasoning=False,
-        inject_date=True,
-        allow_delegation=False,
-        max_iter=25,
-        llm=LLM(model="gemini/gemini-3-pro-preview", temperature=0.4),
-    )
-
-
-def _make_quant() -> Agent:
-    return Agent(
-        config="quant___financial_analysis_specialist",
-        tools=[ScrapeWebsiteTool()],
-        reasoning=False,
-        inject_date=True,
-        allow_delegation=False,
-        max_iter=25,
-        llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.1),
-    )
-
-
-def _make_deep_researcher() -> Agent:
-    return Agent(
-        config="deep_research_analyst___comprehensive_market_intelligence",
-        tools=[SerperDevTool(), FirecrawlScrapeWebsiteTool(), ScrapeWebsiteTool()],
-        reasoning=False,
-        inject_date=True,
-        allow_delegation=False,
-        max_iter=25,
-        llm=LLM(model="gemini/gemini-3-pro-preview", temperature=0.5),
-    )
-
-
-def _make_archivist() -> Agent:
-    return Agent(
-        config="archivist___data_curator_storage_specialist",
-        tools=[FileReadTool()],
-        reasoning=False,
-        inject_date=True,
-        allow_delegation=False,
-        max_iter=25,
-        apps=["box/save_file_from_object"],
-        llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.3),
-    )
-
-
-def _make_report_generator() -> Agent:
-    return Agent(
-        config="mobile_report_generator___bidding_sheet_formatter",
-        tools=[],
-        reasoning=False,
-        inject_date=True,
-        allow_delegation=False,
-        max_iter=25,
-        apps=["box/save_file_from_object"],
-        llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.3),
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # PHASE 1a — SCREENING CREW PART A
 # ═══════════════════════════════════════════════════════════════════════════
 
 @CrewBase
 class ScreeningCrewPartA:
     """Extracts catalog + discovers buyer premium. Outputs ALL lots as JSON."""
+    tasks_config = "config/tasks_1a.yaml"
 
     @agent
     def scout___auction_navigator_keyword_filter(self) -> Agent:
@@ -193,6 +86,7 @@ class ScreeningCrewPartA:
 @CrewBase
 class ScreeningCrewPartB:
     """Risk assessment + detail extraction on pre-filtered lots."""
+    tasks_config = "config/tasks_1b.yaml"
 
     @agent
     def risk_officer___compliance_filtration_specialist(self) -> Agent:
@@ -250,17 +144,18 @@ class ScreeningCrewPartB:
 @CrewBase
 class PerLotValidationCrew:
     """Market validation + profit calculation for a single lot."""
+    tasks_config = "config/tasks_validation.yaml"
 
     @agent
     def market_validator___rapid_assessment_specialist(self) -> Agent:
         return Agent(
             config=self.agents_config["market_validator___rapid_assessment_specialist"],
-            tools=[SerperDevTool(), FirecrawlScrapeWebsiteTool()],
+            tools=[SerperDevTool(), SerperScrapeWebsiteTool(), FirecrawlScrapeWebsiteTool()],
             reasoning=False,
             inject_date=True,
             allow_delegation=False,
-            max_iter=25,
-            llm=LLM(model="gemini/gemini-3-pro-preview", temperature=0.4),
+            max_iter=12,
+            llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.15),
         )
 
     @agent
@@ -307,6 +202,7 @@ class PerLotValidationCrew:
 @CrewBase
 class PerLotDeepResearchCrew:
     """Deep market research + profit analysis for a single lot."""
+    tasks_config = "config/tasks_research.yaml"
 
     @agent
     def deep_research_analyst___comprehensive_market_intelligence(self) -> Agent:
@@ -364,6 +260,7 @@ class PerLotDeepResearchCrew:
 @CrewBase
 class SynthesisCrew:
     """Final ranking, archive, and bidding sheet generation."""
+    tasks_config = "config/tasks_synthesis.yaml"
 
     @agent
     def quant___financial_analysis_specialist(self) -> Agent:

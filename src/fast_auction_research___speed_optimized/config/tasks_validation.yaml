@@ -1,0 +1,87 @@
+---
+per_lot_market_validation:
+  description: |-
+    **MARKET VALIDATION FOR A SINGLE LOT**
+
+    Research this ONE lot and validate its market value:
+    {lot_data}
+
+    **ASSESSMENT METHODOLOGY:**
+    1. **Minimum Data Requirements**:
+       - **8+ SOLD LISTINGS MINIMUM**: Recent sales with prices/dates
+       - **8+ ACTIVE LISTINGS MINIMUM**: Current market pricing
+       - **Only proceed if both minimums met**
+
+    2. **Search Strategy (prioritise speed):**
+       - Search eBay.co.uk sold listings FIRST — this single search should yield 8+ results for most items
+       - Search eBay.co.uk active listings — should yield 8+ results
+       - ONLY search Vestiaire Collective or The RealReal if eBay alone did not meet the 8 sold / 8 active minimums
+       - Do NOT perform authentication verification searches at this stage — that is reserved for deep research
+       - If minimums cannot be met after 4-5 searches, mark the lot as validation_failed and move on — do not keep searching
+
+    3. **PLATFORM FEE ADJUSTMENTS FOR FMV CALCULATION:**
+       When recording "sold for" prices, you MUST adjust for seller fees to get realistic resale value:
+       - **Vestiaire Collective**: seller receives ~85% of "sold for" price (12% commission + 3% payment processing)
+       - **eBay (business seller)**: seller receives ~87% of "sold for" price (~12.8% final value fee)
+       - **eBay (private seller)**: seller receives ~100% of "sold for" price (no fees)
+       - **The RealReal**: seller receives ~60% of "sold for" price (40-50% commission)
+       Record BOTH the raw "sold for" price AND the calculated seller_net for each listing.
+       Use the SELLER NET PROCEEDS (not the listed "sold for" price) when calculating FMV.
+
+    4. **Initial Statistical Analysis**:
+       - Calculate mean/median from seller net proceeds (not raw sold prices)
+       - Assess condition variations in pricing
+       - Market activity scoring (volume, recency)
+
+    5. **Profit Potential Assessment**:
+       - Initial FMV estimate based on seller net proceeds from 8+ sales
+       - Quick margin calculation vs auction estimate
+       - Market liquidity assessment
+  expected_output: 'JSON object for this lot with: lot_number, title, initial_sales_data[]
+    (8+ sold listings with platform, sold_price, seller_net_proceeds for each),
+    active_listings_data[] (8+ active listings), initial_market_statistics{mean_seller_net,
+    median_seller_net, price_range}, market_activity_score, initial_fmv_estimate (GBP, based on seller net),
+    estimated_profit_margin_percentage, market_validation_passed (true/false), and
+    comprehensive_research_recommended (true/false).
+    Output inside a ```json code fence.'
+  agent: market_validator___rapid_assessment_specialist
+
+per_lot_profit_calculation:
+  description: |-
+    **PROFIT CALCULATION FOR A SINGLE LOT** — using the market validation data from the previous task.
+
+    **LOT DATA:** {lot_data}
+    **BUYER'S PREMIUM DATA:** {buyer_premium_data}
+    **PLATFORM FEE CHOICE:** {platform_fee_choice}
+
+    **USE ACTUAL BUYER'S PREMIUM** from the buyer_premium_data — do NOT use a hardcoded rate.
+
+    **PLATFORM FEE:**
+    - If "3_percent_surcharge": add 3% of hammer price to acquisition cost
+    - If "flat_fee_paid": do NOT add the 3% surcharge (user paid a flat registration fee)
+
+    **ACQUISITION COST FORMULA:**
+    total_acquisition_cost = HammerPrice × (1 + buyers_premium_rate) × (1 + VAT_rate_on_premium) + platform_fee + Shipping
+
+    **MINIMUM PROFIT THRESHOLD (with 30% margin floor):**
+    max( min(£200, 50% × total_cost), 30% × total_cost )
+
+    **TWO SEPARATE CALCULATIONS (these are DIFFERENT numbers):**
+
+    1. **expected_profit_margin** = (seller_net_FMV - total_cost_at_HIGH_estimate) / total_cost_at_HIGH_estimate × 100
+       - The REAL profit opportunity assuming the lot sells at its HIGH estimate
+
+    2. **max_safe_bid** = the highest hammer price where profit >= threshold
+       - The user's BIDDING CEILING — a safety limit
+
+    Output the complete financial analysis for this single lot.
+  expected_output: 'JSON object for this lot including: lot_number, title,
+    expected_profit_margin_pct, max_safe_bid (GBP), total_acquisition_cost_at_high_estimate,
+    gross_profit_estimate, ROI, profit_confidence_score,
+    fee_breakdown{buyers_premium_rate_used, buyers_premium_amount, vat_on_premium,
+    internet_surcharge, shipping, selling_fees}, min_profit_threshold_used,
+    initial_fmv_estimate, investment_recommendation (BUY/AVOID/MONITOR).
+    Output inside a ```json code fence.'
+  agent: quant___financial_analysis_specialist
+  context:
+  - per_lot_market_validation
