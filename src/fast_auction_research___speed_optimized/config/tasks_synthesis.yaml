@@ -1,0 +1,87 @@
+---
+synthesis_final_ranking:
+  description: |-
+    **FINAL PROFIT RANKING** — Rank all researched lots by expected_profit_margin descending.
+
+    **ALL RESEARCHED LOTS:**
+    {all_researched_lots}
+
+    **BUYER'S PREMIUM DATA:** {buyer_premium_data}
+
+    **TASKS:**
+    1. Parse all per-lot results
+    2. Sort by expected_profit_margin_pct DESCENDING (most profitable first)
+    3. Assign final BUY/AVOID/MONITOR recommendations
+    4. Preserve ALL per-lot sources{} data
+    5. Calculate summary statistics (total opportunities, total potential profit, etc.)
+
+    Output the ranked list as a JSON array.
+  expected_output: 'JSON array of all lots SORTED BY expected_profit_margin_pct descending,
+    each with: lot_number, title, expected_profit_margin_pct, expected_profit_at_high_estimate,
+    max_safe_bid, total_acquisition_cost, comprehensive_fmv, seller_net_fmv, ROI,
+    fee_breakdown, final_investment_recommendation, sources{}.
+    Output inside a ```json code fence.'
+  agent: quant___financial_analysis_specialist
+
+synthesis_archive:
+  description: |-
+    Process the final ranked opportunities and implement semantic deduplication
+    to prevent duplicate entries. Create structured database records with all collected
+    intelligence: source data, risk assessment, market valuation, financial analysis,
+    and recommendations. Flag any items with expected_profit_margin > 20% for human review queue.
+
+    **IMPORTANT: Preserve the expected_profit_margin ranking order (highest margin first)
+    and the per-lot sources{} data — this data must pass through to the bidding sheet generation.**
+  expected_output: 'Final processed dataset with deduplication report showing:
+    total_items_processed, new_opportunities_identified, duplicates_filtered,
+    high_value_opportunities flagged for review. Output must preserve per-lot sources{}
+    and expected_profit_margin ranking order.'
+  agent: archivist___data_curator_storage_specialist
+  context:
+  - synthesis_final_ranking
+
+synthesis_bidding_sheet:
+  description: |-
+    Transform the processed auction data into a mobile-optimized bidding sheet format AND save it to Box.com.
+
+    **CRITICAL: RANK ALL LOTS BY expected_profit_margin — the REAL opportunity margin at the high estimate. Highest margin first, lowest last.**
+
+    For each viable opportunity, display: lot number, item title, auction estimate range, market value estimate (seller net FMV), expected profit margin at high estimate, max safe bid (bidding ceiling based on max(min(£200, 50%), 30% floor) threshold), and the expected profit in GBP if bought at high estimate.
+
+    Include clear BUY/AVOID/MONITOR recommendations with reasoning.
+
+    **SOURCE DATA:** For each lot, include the research sources organised by platform. Output a JSON structure at the end of the bidding sheet with the following format:
+    ```
+    <!-- SOURCES_JSON_START -->
+    [
+      {
+        "lot": "LOT_NUMBER",
+        "title": "LOT_TITLE",
+        "margin_pct": NUMBER_expected_profit_margin_at_high_estimate,
+        "recommendation": "BUY/AVOID/MONITOR",
+        "sources": {
+          "eBay": [{"title": "...", "sold_price": "...", "url": "..."}],
+          "Vestiaire Collective": [{"title": "...", "sold_price": "...", "url": "..."}],
+          ...
+        }
+      },
+      ...
+    ]
+    <!-- SOURCES_JSON_END -->
+    ```
+
+    Format the main bidding sheet for mobile viewing with clear visual hierarchy, emoji indicators, and essential information prioritised for quick scanning during live auction bidding.
+
+    **IMPORTANT: After generating the bidding sheet, save it to Box.com with filename format: "AUCTION_BIDDING_SHEET_[DATE]_[TIME].md"**
+  expected_output: "Mobile-friendly bidding sheet saved to Box.com as markdown file,
+    with confirmation message including: \"SAVED TO BOX: [filename]\" followed by
+    the bidding sheet content showing: \n\U0001F4F1 AUCTION BIDDING SHEET - [Date]\n\n**RANKED BY EXPECTED PROFIT MARGIN at high estimate (highest first):**\n\nFor
+    each lot:\n\U0001F3AF Lot [NUMBER]: [TITLE] — [EXPECTED_MARGIN]% expected margin\n   \U0001F4B0 Auction Est: £[min]
+    - £[max] \n   \U0001F3EA Market Value (seller net): £[amount]\n   \U0001F4B5 Expected
+    Profit at High Est: £[amount]\n   \n   \U0001F6A7 MAX SAFE BID (ceiling): £[amount]\n
+    \  (based on min profit threshold of £[threshold])\n   \n   \U0001F514 ACTION: [BUY/AVOID/MONITOR]\n
+    \  \U0001F4A1 Note: [brief reason]\n\nFollowed by SOURCES_JSON block.\n\nAt the end, provide
+    a summary count of actionable opportunities and total potential profit."
+  agent: mobile_report_generator___bidding_sheet_formatter
+  context:
+  - synthesis_archive

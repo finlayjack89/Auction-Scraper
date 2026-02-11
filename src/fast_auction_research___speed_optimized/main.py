@@ -1,64 +1,84 @@
 #!/usr/bin/env python
-import sys
-from fast_auction_research___speed_optimized.crew import FastAuctionResearchSpeedOptimizedCrew
+"""
+CLI entry point for running crews locally (dev/testing).
 
-# This main file is intended to be a way for your to run your
-# crew locally, so refrain from adding unnecessary logic into this file.
-# Replace with inputs you want to test with, it will automatically
-# interpolate any tasks and agents information
+The primary way to run the full multi-crew workflow is via `streamlit run app.py`.
+This file is useful for testing individual crews in isolation.
+"""
+
+import sys
+import json
+from fast_auction_research___speed_optimized.crew import (
+    ScreeningCrewPartA,
+    ScreeningCrewPartB,
+    PerLotValidationCrew,
+    PerLotDeepResearchCrew,
+    SynthesisCrew,
+)
+
 
 def run():
     """
-    Run the crew.
+    Run Phase 1a (catalog extraction) as a quick smoke test.
     """
     inputs = {
-        'auction_url': 'sample_value',
-        'search_keyword': 'sample_value'
+        "auction_url": "sample_value",
+        "platform_fee_choice": "3_percent_surcharge",
     }
-    FastAuctionResearchSpeedOptimizedCrew().crew().kickoff(inputs=inputs)
+    result = ScreeningCrewPartA().crew().kickoff(inputs=inputs)
+    print(result)
 
 
 def train():
     """
-    Train the crew for a given number of iterations.
+    Train Phase 1a crew for a given number of iterations.
     """
     inputs = {
-        'auction_url': 'sample_value',
-        'search_keyword': 'sample_value'
+        "auction_url": "sample_value",
+        "platform_fee_choice": "3_percent_surcharge",
     }
     try:
-        FastAuctionResearchSpeedOptimizedCrew().crew().train(n_iterations=int(sys.argv[1]), filename=sys.argv[2], inputs=inputs)
-
+        ScreeningCrewPartA().crew().train(
+            n_iterations=int(sys.argv[2]),
+            filename=sys.argv[3],
+            inputs=inputs,
+        )
     except Exception as e:
         raise Exception(f"An error occurred while training the crew: {e}")
 
+
 def replay():
     """
-    Replay the crew execution from a specific task.
+    Replay a crew execution from a specific task.
     """
     try:
-        FastAuctionResearchSpeedOptimizedCrew().crew().replay(task_id=sys.argv[1])
-
+        ScreeningCrewPartA().crew().replay(task_id=sys.argv[2])
     except Exception as e:
         raise Exception(f"An error occurred while replaying the crew: {e}")
 
+
 def test():
     """
-    Test the crew execution and returns the results.
+    Test Phase 1a crew execution and return results.
     """
     inputs = {
-        'auction_url': 'sample_value',
-        'search_keyword': 'sample_value'
+        "auction_url": "sample_value",
+        "platform_fee_choice": "3_percent_surcharge",
     }
     try:
-        FastAuctionResearchSpeedOptimizedCrew().crew().test(n_iterations=int(sys.argv[1]), openai_model_name=sys.argv[2], inputs=inputs)
-
+        ScreeningCrewPartA().crew().test(
+            n_iterations=int(sys.argv[2]),
+            openai_model_name=sys.argv[3],
+            inputs=inputs,
+        )
     except Exception as e:
         raise Exception(f"An error occurred while testing the crew: {e}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: main.py <command> [<args>]")
+        print("Commands: run, train, replay, test")
         sys.exit(1)
 
     command = sys.argv[1]

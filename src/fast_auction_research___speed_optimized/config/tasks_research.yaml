@@ -1,0 +1,78 @@
+---
+per_lot_deep_research:
+  description: |-
+    **COMPREHENSIVE DEEP MARKET RESEARCH FOR A SINGLE LOT**
+
+    Research this ONE lot exhaustively:
+    {lot_data}
+
+    **RESEARCH METHODOLOGY:**
+
+    1. **Image Matching**: Extract auction images, reverse search across platforms
+    2. **Extensive Data Collection**:
+       - **15+ SALES MINIMUM**: eBay sold, Vestiaire, RealReal, auction houses
+       - **15+ ACTIVE LISTINGS MINIMUM**: Current market comparables
+       - **Exception**: If <15 exist total, analyze ALL available
+
+    3. **PLATFORM FEE ADJUSTMENTS FOR FMV CALCULATION:**
+       When recording "sold for" prices, ALWAYS adjust for seller fees to get realistic resale value:
+       - **Vestiaire Collective**: seller receives ~85% of "sold for" price (12% commission + 3% payment processing)
+       - **eBay (business seller)**: seller receives ~87% of "sold for" price (~12.8% final value fee)
+       - **eBay (private seller)**: seller receives ~100% of "sold for" price (no fees)
+       - **The RealReal**: seller receives ~60% of "sold for" price (40-50% commission)
+       Record BOTH the raw "sold for" price AND the calculated seller_net for each listing.
+       Use the SELLER NET PROCEEDS when calculating comprehensive_market_value_estimate.
+
+    4. **SOURCE TRACKING — MANDATORY:**
+       For EVERY listing found, record: platform name, listing title, sold/asking price, seller_net_proceeds, URL link, and date.
+       Organise sources by platform in the output so they can be displayed to the user.
+
+    5. **Deep Statistical Modeling**:
+       - Condition-adjusted pricing models (using seller net proceeds)
+       - Geographic/seasonal variations
+       - Confidence intervals & outlier analysis
+       - Market liquidity & trend assessment
+  expected_output: 'Comprehensive analysis for this lot: lot_number, title,
+    sources: {"eBay": [{"title": "...", "sold_price": "£X", "seller_net": "£Y", "url": "...", "date": "..."}],
+    "Vestiaire Collective": [...], "The RealReal": [...]},
+    extensive_sales_data[] (15+ sales with seller_net), active_listings_data[] (15+ listings),
+    statistical_analysis, condition_pricing_model,
+    market_liquidity_score, comprehensive_market_value_estimate (GBP, based on seller net proceeds),
+    high_confidence_valuation.
+    Output inside a ```json code fence.'
+  agent: deep_research_analyst___comprehensive_market_intelligence
+
+per_lot_deep_profit:
+  description: |-
+    **FINAL PROFIT ANALYSIS FOR A SINGLE LOT** — using comprehensive deep research data.
+
+    **LOT DATA:** {lot_data}
+    **BUYER'S PREMIUM DATA:** {buyer_premium_data}
+    **PLATFORM FEE CHOICE:** {platform_fee_choice}
+
+    **USE ACTUAL BUYER'S PREMIUM** from the buyer_premium_data — do NOT use a hardcoded rate.
+
+    **PLATFORM FEE:**
+    - If "3_percent_surcharge": add 3% of hammer price to acquisition cost
+    - If "flat_fee_paid": do NOT add the 3% surcharge
+
+    **ACQUISITION COST FORMULA:**
+    total_acquisition_cost = HammerPrice × (1 + buyers_premium_rate) × (1 + VAT_rate_on_premium) + platform_fee + Shipping
+
+    **RESALE VALUE:** Use the comprehensive_market_value_estimate from deep research (seller net proceeds).
+
+    **TWO SEPARATE CALCULATIONS:**
+    1. **expected_profit_margin** = (seller_net_FMV - total_cost_at_HIGH_estimate) / total_cost_at_HIGH_estimate × 100
+    2. **max_safe_bid** = highest hammer price where profit >= max( min(£200, 50% × total_cost), 30% × total_cost )
+
+    **CRITICAL:** Preserve the per-lot "sources" data from deep research for the final report.
+  expected_output: 'JSON object for this lot with: lot_number, title,
+    comprehensive_fmv_used (GBP), seller_net_fmv (GBP),
+    expected_profit_at_high_estimate (GBP), expected_profit_margin_pct,
+    max_safe_bid (GBP), total_acquisition_cost_at_high_estimate, ROI,
+    fee_breakdown, min_profit_threshold_used,
+    final_investment_recommendation (BUY/AVOID/MONITOR), sources{} preserved from deep research.
+    Output inside a ```json code fence.'
+  agent: quant___financial_analysis_specialist
+  context:
+  - per_lot_deep_research

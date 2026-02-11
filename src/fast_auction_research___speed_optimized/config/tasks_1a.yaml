@@ -1,0 +1,75 @@
+---
+input_validation_error_handling:
+  description: Perform comprehensive validation of the auction URL before processing.
+    Test URL accessibility with multiple methods, inspect site structure to identify
+    auction catalogs vs. error pages. Detect common auction platforms (Christie's,
+    Sotheby's, Heritage, etc.) and provide platform-specific guidance. Report
+    estimated lot count, pagination structure, and any access restrictions (login
+    required, geographic blocks, etc.). Note — keyword filtering is handled
+    automatically by the system after extraction; you do not need to validate keywords.
+  expected_output: 'Detailed validation report: {url_status: ''ACCESSIBLE/BLOCKED/ERROR'',
+    platform_detected: ''platform_name'', requires_login: true/false, estimated_lots:
+    number, pagination_detected: true/false, validation_errors: [], recommendations: []}.
+    Include specific fix recommendations for any issues found.'
+  agent: scout___auction_navigator_keyword_filter
+
+discover_buyer_premium:
+  description: |-
+    **BUYER'S PREMIUM DISCOVERY** - Scrape the auction house website at {auction_url} to find the exact buyer's premium percentage and fee structure.
+
+    **DISCOVERY STRATEGY:**
+    1. **Navigate to Terms of Sale / Buyer's Premium page** on the auction house website
+    2. **Look for links** labelled "Terms", "Conditions of Sale", "Buyer's Premium", "Charges", "Fees" from the auction page
+    3. **Extract the buyer's premium percentage** — this is often tiered (e.g. 25% up to £500,000, then 20% above)
+    4. **Determine if VAT is charged on the premium** (most UK auctions charge VAT on buyer's premium)
+    5. **Identify any additional fees** (Artist Resale Rights / ARR, handling fees, etc.)
+
+    **FALLBACK:** If the buyer's premium cannot be found on the website, default to 25% + VAT (20%) which is the most common UK rate.
+
+    **OUTPUT MUST BE STRUCTURED** so downstream agents can use the exact rates in profit calculations.
+  expected_output: 'Structured buyer premium report: {buyers_premium_rate: "25%",
+    buyers_premium_tiered: true/false, tier_details: [{threshold: "£X", rate: "Y%"}],
+    vat_on_premium: true/false, vat_rate: "20%", additional_fees: [], source_url: "URL
+    where terms were found", discovery_method: "scraped/defaulted"}.'
+  agent: scout___auction_navigator_keyword_filter
+  context:
+  - input_validation_error_handling
+
+scout_auction_catalog:
+  description: |-
+    **BULK CATALOG EXTRACTION** — Scrape the ENTIRE auction catalog and output ALL lots as a JSON array. Do NOT filter. The system will filter automatically after you.
+
+    **EXTRACTION STRATEGY:**
+    1. Use FirecrawlScrapeWebsiteTool to capture entire auction catalog from {auction_url}
+    2. Handle pagination — process ALL catalog pages until every lot is captured
+    3. Parse each lot into a structured JSON object
+
+    **OUTPUT FORMAT — MANDATORY:**
+    Output a JSON array inside a ```json code fence. Every lot in the catalog must be included.
+    Each lot object MUST have these fields:
+    - "lot_number": string (the lot number)
+    - "title": string (the full lot title as listed)
+    - "estimate_low": number or null (low estimate in GBP, no currency symbol)
+    - "estimate_high": number or null (high estimate in GBP, no currency symbol)
+    - "description": string (any additional description text, or empty string)
+
+    **EXAMPLE OUTPUT:**
+    ```json
+    [
+      {"lot_number": "1", "title": "A Cartier Santos wristwatch", "estimate_low": 800, "estimate_high": 1200, "description": "Steel case, blue dial, box and papers"},
+      {"lot_number": "2", "title": "Victorian mahogany table", "estimate_low": 200, "estimate_high": 400, "description": ""}
+    ]
+    ```
+
+    **CRITICAL RULES:**
+    - Output ALL lots — do NOT skip any, do NOT filter
+    - The system applies keyword filtering after you — your job is ONLY extraction
+    - If you cannot parse estimates, use null
+    - Always use a ```json code fence around the array
+  expected_output: "A complete JSON array of ALL lots in the catalog inside a ```json
+    code fence. Each lot has: lot_number, title, estimate_low, estimate_high, description.
+    After the JSON, include a brief note: TOTAL LOTS EXTRACTED: [number]."
+  agent: scout___auction_navigator_keyword_filter
+  context:
+  - input_validation_error_handling
+  - discover_buyer_premium

@@ -1,0 +1,105 @@
+---
+risk_assessment_filtering:
+  description: |-
+    **RISK ASSESSMENT ON PRE-FILTERED LOTS**
+
+    You are receiving a list of lots that have ALREADY been keyword-filtered by the system.
+    The filtering is done — your job is ONLY risk assessment.
+
+    **PRE-FILTERED LOTS (from system):**
+    {filtered_lots_json}
+
+    **YOUR TASK — RISK ASSESSMENT ONLY:**
+    Check each lot's title and description for SPECIFIC red flag terms that indicate
+    the item may be counterfeit, damaged beyond repair, or misattributed.
+
+    **RED FLAG TERMS — REJECT only if these appear as MEANINGFUL indicators:**
+
+    ALWAYS REJECT if the title/description contains:
+    - "A/F" or "a/f" (auction shorthand for "as found" = untested/potentially broken)
+    - "as found" (item sold in unknown/untested condition)
+    - "sold as seen" (no returns, no guarantees)
+    - "reproduction" (not an original)
+    - "replica" (counterfeit or copy)
+    - "spares or repair" / "spares or repairs" / "for parts" (broken item)
+    - "faux" ONLY when describing the item's material as fake (e.g. "faux leather", "faux fur").
+      Do NOT flag "faux" if it's part of a brand name or unrelated context.
+    - "no guarantee" or "no warranty" relating to authenticity
+
+    CONTEXT-DEPENDENT — Only reject when used as an ART/ANTIQUES ATTRIBUTION QUALIFIER:
+    - "after [Artist Name]" — means a COPY of the artist's work (e.g. "after Rembrandt").
+      Do NOT reject if "after" appears in normal English usage (e.g. "sought after",
+      "named after", "after cleaning", "after market", etc.)
+    - "style of [Artist/Maker]" — means NOT by that maker, just similar style.
+      Do NOT reject if "style" describes a fashion/design style (e.g. "classic style",
+      "Art Deco style handbag")
+    - "school of [Artist]" — means from the artist's workshop/followers, not the artist
+    - "manner of [Artist]" — similar to "after", means derivative work
+    - "circle of [Artist]" — similar to "school of"
+    - "attributed to" with disclaimers — only flag if paired with doubt language
+
+    **CRITICAL RULES — READ CAREFULLY:**
+    1. You are assessing LUXURY GOODS (handbags, watches, jewelry, designer items).
+       These items almost NEVER use art attribution terms like "after", "style of", "school of".
+       Be very careful not to reject luxury goods just because the word "after" or "style"
+       appears somewhere in the description in normal English usage.
+    2. When in doubt, PASS the lot. It is better to let a borderline lot through to
+       market validation (which will catch bad investments) than to reject a profitable lot.
+    3. Do NOT add lots that are not in your input.
+    4. Do NOT re-apply keyword filtering (already done by the system).
+    5. ONLY reject lots with CLEAR, UNAMBIGUOUS red flags.
+
+    For each lot, assess risk and mark as:
+    - PASS: No red flags found, safe to proceed
+    - REJECT: Contains clear red flag terms — you MUST state the EXACT red flag term found
+      and quote the relevant text from the title/description
+    - FLAG: Minor concern but still worth researching (e.g. "slight wear", "minor scratches")
+
+    **OUTPUT FORMAT:**
+    You MUST output TWO sections:
+
+    SECTION 1: A JSON array inside a ```json code fence containing ONLY the lots that
+    PASSED or were FLAGGED (i.e. everything EXCEPT rejected lots).
+    Each lot object should include all original fields plus: risk_assessment ("PASS" or "FLAG"), risk_notes.
+
+    SECTION 2: After the JSON array, output a REJECTION REPORT listing every rejected lot
+    with the specific reason. Use this exact format:
+
+    RISK REPORT: [received] lots received, [passed] passed, [rejected] rejected, [flagged] flagged.
+
+    REJECTED LOTS:
+    - Lot [number]: "[title]" — REJECTED because: [exact red flag found and quoted text from listing]
+    - Lot [number]: "[title]" — REJECTED because: [exact red flag found and quoted text from listing]
+    ...
+
+    If no lots were rejected, write: "REJECTED LOTS: None"
+  expected_output: 'A JSON array inside a ```json code fence of lots that passed risk
+    assessment. Each lot has all original fields plus risk_assessment and risk_notes.
+    After the JSON, include: RISK REPORT: [received] lots received, [passed] passed,
+    [rejected] rejected, [flagged] flagged. Then REJECTED LOTS section with specific
+    justification for each rejection including the exact red flag term and quoted text.'
+  agent: risk_officer___compliance_filtration_specialist
+
+extract_item_details:
+  description: |-
+    **Process ONLY the risk-assessed lots** passed to you from risk_assessment_filtering.
+    Do NOT add lots that were not in your input.
+
+    For each lot in your input, parse titles and descriptions to identify:
+    brand names, model numbers, materials (gold, silver, stainless steel, leather,
+    etc.), size/dimensions, condition indicators, year/vintage markers, and any special
+    features or attributes. Handle variations in spelling, abbreviations, and auction
+    house terminology. Output clean, standardized data ready for market research.
+
+    **OUTPUT FORMAT:**
+    Output a JSON array inside a ```json code fence. Each lot object should include
+    all original fields plus extracted details.
+
+    **Your output must contain the SAME lots as your input — no additions, no removals.**
+  expected_output: 'A JSON array inside a ```json code fence with extracted details
+    added to each lot: extracted_brand, extracted_model, extracted_materials,
+    extracted_condition, extracted_size, extracted_year, and confidence_scores for
+    each extraction. Lot count must match input.'
+  agent: extractor___item_detail_parser
+  context:
+  - risk_assessment_filtering
