@@ -21,6 +21,7 @@ import re
 import json
 import math
 import time
+import asyncio
 import threading
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -1814,65 +1815,103 @@ if run_button:
         _update_ui()
 
         # ═════════════════════════════════════════════════════════════════
-        # PHASE 1a — STEP 2: Per-Page Extraction (fresh crew per page)
+        # PHASE 1a — STEP 2: Per-Page Extraction (concurrent, capped)
+        #
+        # Runs page extraction crews concurrently with a semaphore to
+        # respect Firecrawl free-plan limits (2 concurrent, 10 RPM).
+        # Each crew gets its own token window so output is never truncated.
+        # Adjust MAX_CONCURRENT_PAGES if you upgrade your Firecrawl plan.
         # ═════════════════════════════════════════════════════════════════
-        tracker.add_log("System", f"Phase 1a-pages: Extracting lots from {len(page_urls)} page(s)")
-        all_lots: list[dict] = []
-        consecutive_empty = 0
-        MAX_CONSECUTIVE_EMPTY = 2  # stop after 2 empty pages in a row
+        MAX_CONCURRENT_PAGES = 2  # safe for Firecrawl free plan (2 concurrent, 10 RPM)
 
-        for page_idx, page_url in enumerate(page_urls):
+        tracker.add_log("System",
+            f"Phase 1a-pages: Extracting lots from {len(page_urls)} page(s) "
+            f"({MAX_CONCURRENT_PAGES} concurrent)"
+        )
+        _update_ui()
+
+        # -- result container (thread-safe via the GIL for simple list ops) --
+        page_results: dict[int, list[dict]] = {}  # page_num -> lots
+
+        async def _extract_one_page(
+            semaphore: asyncio.Semaphore,
+            page_idx: int,
+            page_url: str,
+        ):
+            """Extract lots from a single page, respecting the semaphore."""
             page_num = page_idx + 1
-            tracker.update_extraction(
-                extraction_current_page=f"Page {page_num}",
-                extraction_pages_scraped=page_num,
-            )
-            tracker.set_phase(
-                "Phase 1a: Extracting Catalog",
-                step=f"Scraping page {page_num} of {len(page_urls)}..."
-            )
-            tracker.add_log("Scout", f"Scraping page {page_num}: {page_url[:120]}")
-            _update_ui()
+            async with semaphore:
+                tracker.add_log("Scout", f"Scraping page {page_num}: {page_url[:120]}")
+                tracker.update_extraction(
+                    extraction_current_page=f"Pages {page_num}/{len(page_urls)}",
+                    extraction_pages_scraped=page_num,
+                )
+                tracker.set_phase(
+                    "Phase 1a: Extracting Catalog",
+                    step=f"Scraping page {page_num} of {len(page_urls)} "
+                         f"({MAX_CONCURRENT_PAGES} concurrent)..."
+                )
 
-            try:
-                crew_page = PageExtractionCrew().crew()
-                crew_page.step_callback = make_step_callback(tracker)
-                crew_page.task_callback = make_task_callback(tracker)
+                try:
+                    crew_page = PageExtractionCrew().crew()
+                    crew_page.step_callback = make_step_callback(tracker)
+                    crew_page.task_callback = make_task_callback(tracker)
 
-                result_page = crew_page.kickoff(inputs={
-                    **inputs,
-                    "page_url": page_url,
-                })
+                    # akickoff = native async CrewAI execution
+                    result_page = await crew_page.akickoff(inputs={
+                        **inputs,
+                        "page_url": page_url,
+                    })
 
-                page_lots = parse_lots_from_page_output(result_page)
+                    page_lots = parse_lots_from_page_output(result_page)
 
-                if page_lots:
-                    all_lots.extend(page_lots)
-                    consecutive_empty = 0
-                    tracker.update_extraction(extraction_lots_found=len(all_lots))
-                    tracker.add_log("Scout",
-                        f"Page {page_num}: extracted {len(page_lots)} lots "
-                        f"(running total: {len(all_lots)})"
-                    )
-                else:
-                    consecutive_empty += 1
-                    tracker.add_log("Scout", f"Page {page_num}: 0 lots found")
-                    if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
-                        tracker.add_log("System",
-                            f"Stopping pagination: {MAX_CONSECUTIVE_EMPTY} consecutive empty pages"
+                    if page_lots:
+                        page_results[page_num] = page_lots
+                        # Update running total
+                        running_total = sum(len(v) for v in page_results.values())
+                        tracker.update_extraction(extraction_lots_found=running_total)
+                        tracker.add_log("Scout",
+                            f"Page {page_num}: extracted {len(page_lots)} lots "
+                            f"(running total: {running_total})"
                         )
-                        break
+                    else:
+                        page_results[page_num] = []
+                        tracker.add_log("Scout", f"Page {page_num}: 0 lots found")
 
-            except Exception as exc:
-                tracker.add_log("System", f"Page {page_num} extraction failed: {exc}")
-                consecutive_empty += 1
-                if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
-                    tracker.add_log("System",
-                        f"Stopping pagination after {MAX_CONSECUTIVE_EMPTY} consecutive failures"
-                    )
-                    break
+                except Exception as exc:
+                    page_results[page_num] = []
+                    tracker.add_log("System", f"Page {page_num} extraction failed: {exc}")
 
+        async def _extract_all_pages():
+            """Run all page extractions with bounded concurrency."""
+            sem = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
+            tasks = [
+                _extract_one_page(sem, idx, url)
+                for idx, url in enumerate(page_urls)
+            ]
+            await asyncio.gather(*tasks)
+
+        # Run the async extraction — Streamlit runs sync, so use asyncio.run()
+        # in a thread to avoid event-loop conflicts with Streamlit's own loop.
+        def _run_async_extraction():
+            asyncio.run(_extract_all_pages())
+
+        extraction_thread = threading.Thread(target=_run_async_extraction, daemon=True)
+        extraction_thread.start()
+
+        # Poll for completion while keeping the Streamlit UI responsive
+        while extraction_thread.is_alive():
+            extraction_thread.join(timeout=2.0)
             _update_ui()
+
+        # Assemble all_lots in page order
+        all_lots: list[dict] = []
+        for pg in sorted(page_results.keys()):
+            all_lots.extend(page_results[pg])
+
+        tracker.add_log("System",
+            f"All pages complete: {len(all_lots)} lots from {len(page_urls)} pages"
+        )
 
         # Deduplicate lots by lot_number (in case pages overlap)
         seen_lot_nums: set[str] = set()
