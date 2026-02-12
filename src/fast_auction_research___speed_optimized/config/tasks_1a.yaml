@@ -11,13 +11,19 @@ input_validation_error_handling:
     platform-specific guidance.
 
     **CRITICAL — PAGINATION DETECTION (this is essential for the next phase):**
-    - Scrape the first page of {auction_url}
-    - Find the TOTAL lot count (e.g. "245 lots", "Showing 1-60 of 510 lots")
-    - Count how many lots appear on the first page (this is lots_per_page)
-    - Look for pagination links/buttons: "Next", "Page 2", page numbers "1 2 3 4 5"
-    - Identify the URL pattern for page 2: does it use ?page=2, ?offset=60, ?pageNo=2, /page/2, or something else?
-    - Report the EXACT pagination URL pattern AND the page 2 URL
-    - Calculate total_pages = ceil(total_lots / lots_per_page)
+    1. Scrape the first page of {auction_url}
+    2. Find the TOTAL lot count (e.g. "245 lots", "Showing 1-60 of 510 lots")
+    3. Count how many lots appear on the first page (this is lots_per_page)
+    4. Look for pagination links in the scraped HTML/markdown:
+       - "Next" links, "Page 2" links, numbered page links "1 2 3 4 5"
+       - These are usually <a href="..."> elements in the page
+    5. **Extract the EXACT href URL for page 2 from the HTML** — do NOT guess or construct it.
+       Look for the actual link that the browser would follow when clicking "Page 2" or "Next".
+       Copy the full URL exactly as it appears in the href attribute.
+       Common parameters you might see: ?pn=2, ?page=2, ?p=2, ?pageNo=2, ?offset=60, /page/2
+       DO NOT assume it is ?page=2 — look at the ACTUAL href in the HTML.
+    6. Report the exact pagination URL pattern AND the full page 2 URL.
+    7. Calculate total_pages = ceil(total_lots / lots_per_page)
 
     Note — keyword filtering is handled automatically by the system after extraction; you do not need to validate keywords.
   expected_output: |-
@@ -28,11 +34,13 @@ input_validation_error_handling:
     - estimated_lots: number (TOTAL lots across ALL pages)
     - lots_per_page: number (lots visible on page 1)
     - pagination_detected: true or false
-    - pagination_url_pattern: the URL parameter pattern, e.g. "?page=N" or "?offset=N" or "/page/N"
-    - page_2_url: the FULL URL for page 2 (e.g. "https://example.com/auction/123?page=2")
+    - pagination_url_pattern: the EXACT URL parameter as found in the HTML href (e.g. "?pn=N" or "?page=N")
+    - page_2_url: the FULL URL for page 2 — copied EXACTLY from the page 2 link href in the HTML
     - total_pages: number (calculated or observed)
     - validation_errors: []
     - recommendations: []
+
+    IMPORTANT: page_2_url must be the ACTUAL URL from the HTML pagination link, not a URL you constructed yourself.
   agent: scout___auction_navigator_keyword_filter
 
 discover_buyer_premium:

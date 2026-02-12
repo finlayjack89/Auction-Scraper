@@ -70,7 +70,7 @@ class CatalogSetupCrew:
             inject_date=True,
             allow_delegation=False,
             max_iter=_MAX_ITER,
-            llm=_flash(temperature=0.4),
+            llm=_flash(temperature=0.1),  # low temp for accurate pagination detection
         )
 
     @task
@@ -121,7 +121,7 @@ class PageExtractionCrew:
             inject_date=True,
             allow_delegation=False,
             max_iter=_MAX_ITER,
-            llm=_flash(temperature=0.4),
+            llm=_flash(temperature=0.1),  # low temp for faithful extraction
         )
 
     @task

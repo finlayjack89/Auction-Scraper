@@ -1,7 +1,7 @@
 ---
 extract_single_page:
   description: |-
-    **SINGLE PAGE EXTRACTION** — Scrape exactly ONE catalog page and output all lots found on it as a JSON array. Do NOT navigate to other pages. Do NOT filter lots.
+    **SINGLE PAGE EXTRACTION** — Scrape exactly ONE catalog page and output all lots found on it as a JSON array.
 
     **PAGE TO SCRAPE:** {page_url}
 
@@ -9,31 +9,58 @@ extract_single_page:
     1. Use FirecrawlScrapeWebsiteTool to scrape the page at {page_url}
     2. If Firecrawl returns incomplete content, fall back to ScrapeWebsiteTool
     3. Parse every lot visible on THIS page into a JSON object
-    4. Output the lots as a JSON array — do NOT try to navigate to other pages
+    4. Do NOT navigate to other pages — only extract lots from {page_url}
+
+    ╔══════════════════════════════════════════════════════════════════╗
+    ║  CRITICAL — ACCURACY RULES (READ CAREFULLY)                    ║
+    ║                                                                ║
+    ║  • COPY each lot title EXACTLY as it appears on the page.      ║
+    ║    Do NOT rewrite, summarise, shorten, or paraphrase titles.   ║
+    ║  • COPY the description text EXACTLY as written on the page.   ║
+    ║    Do NOT invent, embellish, or add details that are not on    ║
+    ║    the page.                                                   ║
+    ║  • COPY the lot number EXACTLY as shown on the page.           ║
+    ║  • COPY the estimate values EXACTLY as shown on the page.      ║
+    ║  • If a field is not present on the page, use null or "".      ║
+    ║    Do NOT guess or fabricate values.                            ║
+    ║                                                                ║
+    ║  YOU MUST NOT:                                                 ║
+    ║  • Invent lot titles that are not on the page                  ║
+    ║  • Change the wording of any title or description              ║
+    ║  • Assign wrong lot numbers to titles                          ║
+    ║  • Generate plausible-sounding auction data from memory        ║
+    ║  • Summarise a title (e.g. "A gold ring" instead of the full  ║
+    ║    title "A late Victorian 18ct gold old-cut diamond and       ║
+    ║    ruby five-stone ring, with scroll-carved gallery")          ║
+    ║                                                                ║
+    ║  Every field must come DIRECTLY from the scraped page content. ║
+    ║  If you cannot find a value on the page, use null.             ║
+    ╚══════════════════════════════════════════════════════════════════╝
 
     **OUTPUT FORMAT — MANDATORY:**
     Output a JSON array inside a ```json code fence. Include ONLY the lots on THIS page.
     Each lot object MUST have these fields:
-    - "lot_number": string (the lot number)
-    - "title": string (the full lot title as listed)
-    - "estimate_low": number or null (low estimate in GBP, no currency symbol)
-    - "estimate_high": number or null (high estimate in GBP, no currency symbol)
-    - "description": string (any additional description text, or empty string)
+    - "lot_number": string — the lot number exactly as shown on the page
+    - "title": string — the FULL lot title exactly as written on the page, word for word
+    - "estimate_low": number or null — low estimate in GBP, no currency symbol
+    - "estimate_high": number or null — high estimate in GBP, no currency symbol
+    - "description": string — the description or additional text exactly as shown, or ""
 
-    **EXAMPLE OUTPUT:**
-    ```json
-    [
-      {"lot_number": "1", "title": "A Cartier Santos wristwatch", "estimate_low": 800, "estimate_high": 1200, "description": "Steel case, blue dial, box and papers"},
-      {"lot_number": "2", "title": "Victorian mahogany table", "estimate_low": 200, "estimate_high": 400, "description": ""}
-    ]
-    ```
+    **EXAMPLE OF CORRECT EXTRACTION:**
+    If the page shows: "Lot 246 — Anya Hindmarch, a navy blue wool blend coat, size 10"
+    Then output: {{"lot_number": "246", "title": "Anya Hindmarch, a navy blue wool blend coat, size 10", ...}}
 
-    **CRITICAL RULES:**
+    **EXAMPLE OF WRONG EXTRACTION (DO NOT DO THIS):**
+    Inventing: {{"lot_number": "246", "title": "A Chanel Quilted Lambskin Classic Flap bag", ...}}
+    This is WRONG because the title does not match what is on the page.
+
+    **FINAL RULES:**
     - Output ALL lots on THIS page — do NOT skip any, do NOT filter
     - Do NOT navigate to other pages — only scrape {page_url}
     - If you cannot parse estimates, use null
     - Always use a ```json code fence around the array
   expected_output: "A JSON array of all lots found on this single page, inside a ```json
     code fence. Each lot has: lot_number, title, estimate_low, estimate_high, description.
+    Every title and description must be copied VERBATIM from the page — not summarised or invented.
     After the JSON, state: LOTS ON THIS PAGE: [number]."
   agent: scout___auction_navigator_keyword_filter

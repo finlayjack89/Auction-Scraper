@@ -233,7 +233,7 @@ class ProgressTracker:
                 if lot_num not in self.lots:
                     self.lots[lot_num] = LotInfo(
                         lot_num=lot_num,
-                        title=lot.get("title", "")[:80],
+                        title=lot.get("title", ""),
                         status="found",
                         stage="Filtered",
                     )
@@ -803,13 +803,13 @@ def _detect_pattern_from_page2_url(base_url: str, page2_url: str) -> str | None:
 def construct_page_urls(base_url: str, pagination_info: dict) -> list[str]:
     """Construct a list of all page URLs to scrape, including page 1.
 
-    Returns a list of URLs: [page1_url, page2_url, page3_url, ...]
-    Uses the pagination info from the validation task to construct URLs.
-    Falls back to common patterns if detection is unreliable.
+    Strategy: ALWAYS use the page_2_url directly with number substitution.
+    This preserves the exact query parameter the auction site uses (e.g. ?pn=N
+    vs ?page=N vs ?pageNo=N) rather than trying to detect and map to generic
+    patterns, which is error-prone when the LLM misidentifies the parameter.
     """
     total_pages = max(1, pagination_info.get("total_pages", 1))
     page2_url = pagination_info.get("page_2_url", "")
-    pattern_str = pagination_info.get("pagination_url_pattern", "")
 
     # Page 1 is always the base URL
     urls = [base_url]
@@ -817,81 +817,39 @@ def construct_page_urls(base_url: str, pagination_info: dict) -> list[str]:
     if total_pages <= 1:
         return urls
 
-    # Detect the pattern from page_2_url or the reported pattern string
-    pattern = _detect_pattern_from_page2_url(base_url, page2_url)
-
-    if pattern is None and pattern_str:
-        # Try to infer from the pattern string
-        pattern_lower = pattern_str.lower()
-        if "page=n" in pattern_lower or "?page=" in pattern_lower:
-            pattern = "page"
-        elif "offset=" in pattern_lower:
-            pattern = "offset_from_pattern"
-        elif "/page/" in pattern_lower:
-            pattern = "path_page"
-        elif "pageno=" in pattern_lower:
-            pattern = "pageNo"
-        elif "p=" in pattern_lower:
-            pattern = "p"
-
-    # If we have a concrete page_2_url but couldn't detect the pattern,
-    # use the page_2_url directly for page 2 and try query param substitution for rest
-    if pattern is None and page2_url:
+    # ── Primary strategy: use page_2_url with number substitution ──
+    # This is the most robust approach — it preserves whatever query param
+    # the LLM extracted from the actual HTML, instead of re-interpreting it.
+    if page2_url:
         urls.append(page2_url)
-        # Try to construct subsequent pages by incrementing the number in page2_url
         for pg in range(3, total_pages + 1):
-            # Replace "2" with pg in the last occurrence of "2" in query string
-            candidate = re.sub(r'(\d+)(?=[^/\d]*$)', str(pg), page2_url, count=1)
+            # Replace the "2" in the query string with the target page number.
+            # We target the LAST standalone number in the URL (the pagination param)
+            # by matching "=2" at word boundary or "/2" at end of path segment.
+            candidate = re.sub(
+                r'([=/])2(?=\b|[&?/\s]|$)',
+                rf'\g<1>{pg}',
+                page2_url,
+                count=1,
+            )
             if candidate != page2_url:
                 urls.append(candidate)
             else:
-                break
+                # Fallback: simple last-number replacement
+                candidate = re.sub(r'(\d+)(?=[^/\d]*$)', str(pg), page2_url, count=1)
+                if candidate != page2_url:
+                    urls.append(candidate)
+                else:
+                    break
         return urls
 
-    # Build URLs based on the detected pattern
+    # ── Fallback: no page_2_url — try ?page=N on the base URL ──
     parsed = urlparse(base_url)
-    lots_per_page = pagination_info.get("lots_per_page", 60) or 60
-
     for pg in range(2, total_pages + 1):
-        if pattern == "page":
-            qs = parse_qs(parsed.query, keep_blank_values=True)
-            qs["page"] = [str(pg)]
-            new_query = urlencode(qs, doseq=True)
-            url = urlunparse(parsed._replace(query=new_query))
-        elif pattern == "pageNo":
-            qs = parse_qs(parsed.query, keep_blank_values=True)
-            qs["pageNo"] = [str(pg)]
-            new_query = urlencode(qs, doseq=True)
-            url = urlunparse(parsed._replace(query=new_query))
-        elif pattern == "page_no":
-            qs = parse_qs(parsed.query, keep_blank_values=True)
-            qs["page_no"] = [str(pg)]
-            new_query = urlencode(qs, doseq=True)
-            url = urlunparse(parsed._replace(query=new_query))
-        elif pattern == "p":
-            qs = parse_qs(parsed.query, keep_blank_values=True)
-            qs["p"] = [str(pg)]
-            new_query = urlencode(qs, doseq=True)
-            url = urlunparse(parsed._replace(query=new_query))
-        elif pattern and pattern.startswith("offset"):
-            offset = (pg - 1) * lots_per_page
-            qs = parse_qs(parsed.query, keep_blank_values=True)
-            qs["offset"] = [str(offset)]
-            new_query = urlencode(qs, doseq=True)
-            url = urlunparse(parsed._replace(query=new_query))
-        elif pattern == "path_page":
-            # /page/N pattern
-            path = parsed.path.rstrip("/")
-            # Remove existing /page/N if present
-            path = re.sub(r'/page/\d+', '', path)
-            url = urlunparse(parsed._replace(path=f"{path}/page/{pg}"))
-        else:
-            # Default fallback: try ?page=N
-            qs = parse_qs(parsed.query, keep_blank_values=True)
-            qs["page"] = [str(pg)]
-            new_query = urlencode(qs, doseq=True)
-            url = urlunparse(parsed._replace(query=new_query))
-
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        qs["page"] = [str(pg)]
+        new_query = urlencode(qs, doseq=True)
+        url = urlunparse(parsed._replace(query=new_query))
         urls.append(url)
 
     return urls
@@ -1269,7 +1227,7 @@ def render_lots(tracker: ProgressTracker, container):
 
                     rows.append({
                         "Lot": lot.lot_num,
-                        "Title": lot.title[:55] if lot.title else "-",
+                        "Title": lot.title if lot.title else "-",
                         "Stage": lot.stage or "-",
                         "FMV": lot.fmv or "-",
                         "Margin": lot.margin or "-",
@@ -1288,7 +1246,7 @@ def render_lots(tracker: ProgressTracker, container):
                 for lot in sorted(rejected_lots, key=lambda l: int(l.lot_num) if l.lot_num.isdigit() else 0):
                     rows.append({
                         "Lot": lot.lot_num,
-                        "Title": lot.title[:50] if lot.title else "-",
+                        "Title": lot.title if lot.title else "-",
                         "Rejection Reason": lot.rejection_reason or "No details",
                     })
 
@@ -1780,18 +1738,6 @@ if run_button:
 
     start_time = time.time()
 
-    # #region agent log — CANARY: confirm instrumented code is running
-    _DBG_LOG_PATH = os.path.join(_PROJECT_ROOT, ".cursor", "debug.log")
-    os.makedirs(os.path.dirname(_DBG_LOG_PATH), exist_ok=True)
-    def _dbg(msg, data, hyp="X"):
-        try:
-            with open(_DBG_LOG_PATH, "a") as _f:
-                _f.write(json.dumps({"timestamp": int(time.time()*1000), "location": "app.py", "message": msg, "data": data, "hypothesisId": hyp}) + "\n")
-        except Exception:
-            pass
-    _dbg("CANARY_workflow_start", {"auction_url": inputs.get("auction_url", "")[:100], "phrases": phrases}, "CANARY")
-    # #endregion
-
     try:
         # ═════════════════════════════════════════════════════════════════
         # PHASE 1a — STEP 1: Catalog Setup (validation + buyer premium)
@@ -1806,15 +1752,6 @@ if run_button:
 
         result_setup = crew_setup.kickoff(inputs=inputs)
 
-        # #region agent log — Hypothesis E: CatalogSetupCrew output
-        _dbg("setup_crew_result_type", {"type": str(type(result_setup)), "has_raw": hasattr(result_setup, "raw"), "raw_len": len(getattr(result_setup, "raw", "")), "raw_first_500": getattr(result_setup, "raw", "")[:500]}, "E")
-        _setup_tasks = getattr(result_setup, "tasks_output", None)
-        _dbg("setup_tasks_output", {"count": len(_setup_tasks) if _setup_tasks else 0, "task_names": [getattr(t, "name", getattr(t, "description", "?"))[:80] for t in (_setup_tasks or [])]}, "E")
-        if _setup_tasks:
-            for _i, _t in enumerate(_setup_tasks):
-                _dbg(f"setup_task_{_i}_raw", {"raw_len": len(getattr(_t, "raw", "")), "raw_first_800": getattr(_t, "raw", "")[:800]}, "E")
-        # #endregion
-
         buyer_premium_data = extract_buyer_premium(result_setup)
 
         # Parse pagination info from the validation task output
@@ -1825,12 +1762,6 @@ if run_button:
 
         pagination_info = _parse_pagination_info(validation_raw)
         page_urls = construct_page_urls(inputs["auction_url"], pagination_info)
-
-        # #region agent log — Hypothesis A: Pagination parsing
-        _dbg("validation_raw_length", {"len": len(validation_raw), "first_600": validation_raw[:600]}, "A")
-        _dbg("pagination_info_parsed", {"info": pagination_info}, "A")
-        _dbg("page_urls_constructed", {"count": len(page_urls), "urls": page_urls[:10]}, "A")
-        # #endregion
 
         tracker.add_log("System",
             f"Pagination detected: {pagination_info['pagination_detected']}, "
@@ -1880,36 +1811,29 @@ if run_button:
                 )
 
                 try:
-                    # #region agent log — Hypothesis B: crew task list
                     crew_page = PageExtractionCrew().crew()
-                    _dbg(f"page_{page_num}_crew_tasks", {"task_count": len(crew_page.tasks), "task_names": [getattr(t, "name", getattr(t, "description", "?"))[:80] for t in crew_page.tasks], "agent_count": len(crew_page.agents)}, "B")
-                    # #endregion
                     crew_page.step_callback = make_step_callback(tracker)
                     crew_page.task_callback = make_task_callback(tracker)
 
-                    # #region agent log — Hypothesis C: akickoff execution
-                    _dbg(f"page_{page_num}_akickoff_start", {"page_num": page_num, "page_url": page_url[:150]}, "C")
-                    # #endregion
                     # akickoff = native async CrewAI execution
                     result_page = await crew_page.akickoff(inputs={
                         **inputs,
                         "page_url": page_url,
                     })
 
-                    # #region agent log — Hypothesis C+D: result inspection
-                    _dbg(f"page_{page_num}_akickoff_result", {"type": str(type(result_page)), "has_raw": hasattr(result_page, "raw"), "raw_len": len(getattr(result_page, "raw", "")), "raw_first_500": getattr(result_page, "raw", "")[:500]}, "CD")
-                    _pg_tasks = getattr(result_page, "tasks_output", None)
-                    _dbg(f"page_{page_num}_tasks_output", {"count": len(_pg_tasks) if _pg_tasks else 0}, "CD")
-                    if _pg_tasks:
-                        for _pi, _pt in enumerate(_pg_tasks):
-                            _dbg(f"page_{page_num}_task_{_pi}_raw", {"raw_len": len(getattr(_pt, "raw", "")), "raw_first_500": getattr(_pt, "raw", "")[:500]}, "CD")
-                    # #endregion
-
                     page_lots = parse_lots_from_page_output(result_page)
 
-                    # #region agent log — Hypothesis D: parse result
-                    _dbg(f"page_{page_num}_parsed_lots", {"count": len(page_lots), "first_2": page_lots[:2] if page_lots else []}, "D")
-                    # #endregion
+                    # ── Duplicate page detection ──
+                    # If a page (other than page 1) returns lots starting from
+                    # lot 1 or 2, the pagination URL was wrong and the server
+                    # returned page 1 content.  Discard these duplicates.
+                    if page_num > 1 and page_lots:
+                        first_lot_num = str(page_lots[0].get("lot_number", ""))
+                        if first_lot_num in ("1", "2", "01", "02"):
+                            tracker.add_log("Scout",
+                                f"Page {page_num}: DUPLICATE detected (starts at lot {first_lot_num}) — discarding"
+                            )
+                            page_lots = []  # discard
 
                     if page_lots:
                         page_results[page_num] = page_lots
@@ -1925,10 +1849,6 @@ if run_button:
                         tracker.add_log("Scout", f"Page {page_num}: 0 lots found")
 
                 except Exception as exc:
-                    # #region agent log — Hypothesis C: exception details
-                    import traceback as _tb
-                    _dbg(f"page_{page_num}_exception", {"page_num": page_num, "error": str(exc), "traceback": _tb.format_exc()}, "C")
-                    # #endregion
                     page_results[page_num] = []
                     tracker.add_log("System", f"Page {page_num} extraction failed: {exc}")
 
@@ -1946,14 +1866,8 @@ if run_button:
         def _run_async_extraction():
             try:
                 asyncio.run(_extract_all_pages())
-                # #region agent log — thread completion
-                _dbg("async_extraction_complete", {"page_results_keys": list(page_results.keys()), "total_lots": sum(len(v) for v in page_results.values())}, "C")
-                # #endregion
-            except Exception as _thr_exc:
-                # #region agent log — thread-level error
-                import traceback as _tb2
-                _dbg("async_thread_exception", {"error": str(_thr_exc), "traceback": _tb2.format_exc()}, "C")
-                # #endregion
+            except Exception:
+                pass  # individual page errors already handled
 
         extraction_thread = threading.Thread(target=_run_async_extraction, daemon=True)
         extraction_thread.start()
@@ -1986,10 +1900,6 @@ if run_button:
 
         tracker.total_catalog_lots = len(all_lots)
         tracker.add_log("System", f"Catalog extracted: {len(all_lots)} total lots")
-
-        # #region agent log — final lot count before keyword filter
-        _dbg("all_lots_final", {"count": len(all_lots), "first_3": all_lots[:3] if all_lots else [], "page_results_summary": {str(k): len(v) for k, v in page_results.items()}}, "FINAL")
-        # #endregion
 
         # ═════════════════════════════════════════════════════════════════
         # PYTHON KEYWORD FILTER (deterministic)
@@ -2048,6 +1958,7 @@ if run_button:
         })
 
         extracted_lots = parse_extracted_lots(result_1b)
+
         if not extracted_lots:
             # Fallback: use filtered_lots directly if parsing failed
             extracted_lots = filtered_lots
@@ -2211,10 +2122,6 @@ if run_button:
         tracker.add_log("System", "Workflow complete!")
 
     except Exception as exc:
-        # #region agent log — outer exception
-        import traceback as _tb3
-        _dbg("OUTER_EXCEPTION", {"error": str(exc), "type": str(type(exc)), "traceback": _tb3.format_exc()}, "OUTER")
-        # #endregion
         tracker.finished = True
         tracker.error = exc
         tracker.add_log("System", f"Workflow failed: {exc}")
