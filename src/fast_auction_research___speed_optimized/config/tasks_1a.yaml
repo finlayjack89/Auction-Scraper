@@ -1,16 +1,38 @@
 ---
+# ═══════════════════════════════════════════════════════════════════════
+# SETUP TASKS (CatalogSetupCrew — runs once)
+# ═══════════════════════════════════════════════════════════════════════
+
 input_validation_error_handling:
-  description: Perform comprehensive validation of the auction URL before processing.
-    Test URL accessibility with multiple methods, inspect site structure to identify
-    auction catalogs vs. error pages. Detect common auction platforms (Christie's,
-    Sotheby's, Heritage, etc.) and provide platform-specific guidance. Report
-    estimated lot count, pagination structure, and any access restrictions (login
-    required, geographic blocks, etc.). Note — keyword filtering is handled
-    automatically by the system after extraction; you do not need to validate keywords.
-  expected_output: 'Detailed validation report: {url_status: ''ACCESSIBLE/BLOCKED/ERROR'',
-    platform_detected: ''platform_name'', requires_login: true/false, estimated_lots:
-    number, pagination_detected: true/false, validation_errors: [], recommendations: []}.
-    Include specific fix recommendations for any issues found.'
+  description: |-
+    Perform comprehensive validation of the auction URL before processing.
+    Test URL accessibility, inspect site structure to identify auction catalogs vs. error pages.
+    Detect common auction platforms (Christie's, Sotheby's, Heritage, etc.) and provide
+    platform-specific guidance.
+
+    **CRITICAL — PAGINATION DETECTION (this is essential for the next phase):**
+    - Scrape the first page of {auction_url}
+    - Find the TOTAL lot count (e.g. "245 lots", "Showing 1-60 of 510 lots")
+    - Count how many lots appear on the first page (this is lots_per_page)
+    - Look for pagination links/buttons: "Next", "Page 2", page numbers "1 2 3 4 5"
+    - Identify the URL pattern for page 2: does it use ?page=2, ?offset=60, ?pageNo=2, /page/2, or something else?
+    - Report the EXACT pagination URL pattern AND the page 2 URL
+    - Calculate total_pages = ceil(total_lots / lots_per_page)
+
+    Note — keyword filtering is handled automatically by the system after extraction; you do not need to validate keywords.
+  expected_output: |-
+    Structured validation report with these EXACT fields (the system parses them):
+    - url_status: ACCESSIBLE or BLOCKED or ERROR
+    - platform_detected: platform name
+    - requires_login: true or false
+    - estimated_lots: number (TOTAL lots across ALL pages)
+    - lots_per_page: number (lots visible on page 1)
+    - pagination_detected: true or false
+    - pagination_url_pattern: the URL parameter pattern, e.g. "?page=N" or "?offset=N" or "/page/N"
+    - page_2_url: the FULL URL for page 2 (e.g. "https://example.com/auction/123?page=2")
+    - total_pages: number (calculated or observed)
+    - validation_errors: []
+    - recommendations: []
   agent: scout___auction_navigator_keyword_filter
 
 discover_buyer_premium:
@@ -35,17 +57,24 @@ discover_buyer_premium:
   context:
   - input_validation_error_handling
 
-scout_auction_catalog:
-  description: |-
-    **BULK CATALOG EXTRACTION** — Scrape the ENTIRE auction catalog and output ALL lots as a JSON array. Do NOT filter. The system will filter automatically after you.
+# ═══════════════════════════════════════════════════════════════════════
+# PER-PAGE EXTRACTION TASK (PageExtractionCrew — runs once per page)
+# ═══════════════════════════════════════════════════════════════════════
 
-    **EXTRACTION STRATEGY:**
-    1. Use FirecrawlScrapeWebsiteTool to capture entire auction catalog from {auction_url}
-    2. Handle pagination — process ALL catalog pages until every lot is captured
-    3. Parse each lot into a structured JSON object
+extract_single_page:
+  description: |-
+    **SINGLE PAGE EXTRACTION** — Scrape exactly ONE catalog page and output all lots found on it as a JSON array. Do NOT navigate to other pages. Do NOT filter lots.
+
+    **PAGE TO SCRAPE:** {page_url}
+
+    **INSTRUCTIONS:**
+    1. Use FirecrawlScrapeWebsiteTool to scrape the page at {page_url}
+    2. If Firecrawl returns incomplete content, fall back to ScrapeWebsiteTool
+    3. Parse every lot visible on THIS page into a JSON object
+    4. Output the lots as a JSON array — do NOT try to navigate to other pages
 
     **OUTPUT FORMAT — MANDATORY:**
-    Output a JSON array inside a ```json code fence. Every lot in the catalog must be included.
+    Output a JSON array inside a ```json code fence. Include ONLY the lots on THIS page.
     Each lot object MUST have these fields:
     - "lot_number": string (the lot number)
     - "title": string (the full lot title as listed)
@@ -62,14 +91,11 @@ scout_auction_catalog:
     ```
 
     **CRITICAL RULES:**
-    - Output ALL lots — do NOT skip any, do NOT filter
-    - The system applies keyword filtering after you — your job is ONLY extraction
+    - Output ALL lots on THIS page — do NOT skip any, do NOT filter
+    - Do NOT navigate to other pages — only scrape {page_url}
     - If you cannot parse estimates, use null
     - Always use a ```json code fence around the array
-  expected_output: "A complete JSON array of ALL lots in the catalog inside a ```json
+  expected_output: "A JSON array of all lots found on this single page, inside a ```json
     code fence. Each lot has: lot_number, title, estimate_low, estimate_high, description.
-    After the JSON, include a brief note: TOTAL LOTS EXTRACTED: [number]."
+    After the JSON, state: LOTS ON THIS PAGE: [number]."
   agent: scout___auction_navigator_keyword_filter
-  context:
-  - input_validation_error_handling
-  - discover_buyer_premium

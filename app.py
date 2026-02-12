@@ -19,10 +19,12 @@ import os
 import io
 import re
 import json
+import math
 import time
 import threading
 from datetime import datetime
 from dataclasses import dataclass, field
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qs, urljoin
 
 # ── Project root & src/ on sys.path ────────────────────────────────────────
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -585,8 +587,53 @@ def apply_keyword_filter(
 # JSON PARSING HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _repair_truncated_json_array(text: str) -> list | None:
+    """Attempt to recover a truncated JSON array by finding the last complete object.
+
+    If the LLM output was cut off mid-JSON (e.g. the closing ] is missing, or an
+    object is only half-written), this finds the last complete {...} and closes the
+    array.  Returns a list of dicts, or None if nothing useful could be recovered.
+    """
+    # Find the opening bracket
+    start = text.find("[")
+    if start == -1:
+        return None
+
+    # Try to find the last complete JSON object (ends with })
+    last_brace = text.rfind("}")
+    if last_brace == -1 or last_brace <= start:
+        return None
+
+    candidate = text[start:last_brace + 1].rstrip().rstrip(",") + "]"
+    try:
+        result = json.loads(candidate)
+        if isinstance(result, list) and len(result) > 0:
+            print(f"[JSON-REPAIR] Recovered {len(result)} items from truncated JSON array")
+            return result
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # More aggressive: iterate backwards to find a valid cut point
+    search_from = last_brace
+    for _ in range(50):  # try up to 50 positions backwards
+        prev_brace = text.rfind("}", start, search_from)
+        if prev_brace == -1 or prev_brace <= start:
+            break
+        candidate = text[start:prev_brace + 1].rstrip().rstrip(",") + "]"
+        try:
+            result = json.loads(candidate)
+            if isinstance(result, list) and len(result) > 0:
+                print(f"[JSON-REPAIR] Recovered {len(result)} items (aggressive) from truncated JSON")
+                return result
+        except (json.JSONDecodeError, TypeError):
+            pass
+        search_from = prev_brace
+
+    return None
+
+
 def _extract_json_from_output(raw: str) -> list | dict | None:
-    """Extract JSON from a crew output, handling ```json code fences."""
+    """Extract JSON from a crew output, handling ```json code fences and truncation."""
     if not raw:
         return None
 
@@ -596,7 +643,17 @@ def _extract_json_from_output(raw: str) -> list | dict | None:
         try:
             return json.loads(m.group(1).strip())
         except (json.JSONDecodeError, TypeError):
-            pass
+            # Fence found but JSON broken — try repair
+            repaired = _repair_truncated_json_array(m.group(1))
+            if repaired:
+                return repaired
+
+    # Handle ```json fence without closing ``` (truncation mid-fence)
+    m = re.search(r'```json\s*\n?(.*)', raw, re.DOTALL)
+    if m:
+        repaired = _repair_truncated_json_array(m.group(1))
+        if repaired:
+            return repaired
 
     # Try to find a bare JSON array or object
     for pattern in [r'(\[.*\])', r'(\{.*\})']:
@@ -613,35 +670,230 @@ def _extract_json_from_output(raw: str) -> list | dict | None:
     except (json.JSONDecodeError, TypeError):
         pass
 
+    # Final fallback: try repair on the raw string
+    repaired = _repair_truncated_json_array(raw)
+    if repaired:
+        return repaired
+
     return None
 
 
-def parse_lots_from_output(result) -> list[dict]:
-    """Extract lot array from Scout crew output (Phase 1a)."""
+def parse_lots_from_page_output(result) -> list[dict]:
+    """Extract lot array from a single-page extraction crew output."""
     raw = getattr(result, "raw", str(result))
 
-    # Try task outputs — the scout catalog is the last task (index 2)
+    # Try the last task output (there's only one task in PageExtractionCrew)
     task_outputs = getattr(result, "tasks_output", None)
-    if task_outputs and len(task_outputs) >= 3:
-        scout_raw = getattr(task_outputs[2], "raw", "")
-        parsed = _extract_json_from_output(scout_raw)
-        if isinstance(parsed, list):
-            return parsed
+    if task_outputs:
+        for t_out in reversed(task_outputs):
+            t_raw = getattr(t_out, "raw", "")
+            parsed = _extract_json_from_output(t_raw)
+            if isinstance(parsed, list) and len(parsed) > 0:
+                return parsed
 
     # Fall back to main output
     parsed = _extract_json_from_output(raw)
     if isinstance(parsed, list):
         return parsed
 
+    print(f"[WARN] parse_lots_from_page_output: could not parse lots. Raw output length={len(raw)}")
+    print(f"[DEBUG] First 500 chars: {raw[:500]}")
     return []
 
 
 def extract_buyer_premium(result) -> str:
-    """Extract buyer premium data string from Phase 1a output."""
+    """Extract buyer premium data string from CatalogSetupCrew output (task index 1)."""
     task_outputs = getattr(result, "tasks_output", None)
     if task_outputs and len(task_outputs) >= 2:
         return getattr(task_outputs[1], "raw", "")
+    # Fallback: try last task
+    if task_outputs:
+        return getattr(task_outputs[-1], "raw", "")
     return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PAGINATION URL CONSTRUCTION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _parse_pagination_info(validation_raw: str) -> dict:
+    """Parse pagination fields from the validation task output.
+
+    Returns dict with keys: estimated_lots, lots_per_page, pagination_detected,
+    pagination_url_pattern, page_2_url, total_pages.
+    """
+    info: dict = {
+        "estimated_lots": 0,
+        "lots_per_page": 0,
+        "pagination_detected": False,
+        "pagination_url_pattern": "",
+        "page_2_url": "",
+        "total_pages": 1,
+    }
+    if not validation_raw:
+        return info
+
+    text = validation_raw
+
+    # estimated_lots
+    m = re.search(r'estimated_lots\s*[:=]\s*(\d+)', text, re.IGNORECASE)
+    if m:
+        info["estimated_lots"] = int(m.group(1))
+
+    # lots_per_page
+    m = re.search(r'lots_per_page\s*[:=]\s*(\d+)', text, re.IGNORECASE)
+    if m:
+        info["lots_per_page"] = int(m.group(1))
+
+    # pagination_detected
+    m = re.search(r'pagination_detected\s*[:=]\s*(true|false|yes|no)', text, re.IGNORECASE)
+    if m:
+        info["pagination_detected"] = m.group(1).lower() in ("true", "yes")
+
+    # total_pages
+    m = re.search(r'total_pages\s*[:=]\s*(\d+)', text, re.IGNORECASE)
+    if m:
+        info["total_pages"] = int(m.group(1))
+
+    # pagination_url_pattern (e.g. "?page=N", "?offset=N")
+    m = re.search(r'pagination_url_pattern\s*[:=]\s*["\']?([^"\'}\n,]+)', text, re.IGNORECASE)
+    if m:
+        info["pagination_url_pattern"] = m.group(1).strip().strip("\"'")
+
+    # page_2_url (full URL for page 2)
+    m = re.search(r'page_2_url\s*[:=]\s*["\']?(https?://[^\s"\'}\n,]+)', text, re.IGNORECASE)
+    if m:
+        info["page_2_url"] = m.group(1).strip().strip("\"'")
+
+    # Infer total_pages from estimated_lots / lots_per_page if not reported
+    if info["total_pages"] <= 1 and info["estimated_lots"] > 0 and info["lots_per_page"] > 0:
+        info["total_pages"] = math.ceil(info["estimated_lots"] / info["lots_per_page"])
+
+    return info
+
+
+def _detect_pattern_from_page2_url(base_url: str, page2_url: str) -> str | None:
+    """Detect the pagination URL pattern by comparing page 1 and page 2 URLs."""
+    if not page2_url:
+        return None
+
+    # Check for ?page=2 / &page=2
+    if "page=2" in page2_url.lower():
+        return "page"
+    if "pageno=2" in page2_url.lower():
+        return "pageNo"
+    if "page_no=2" in page2_url.lower():
+        return "page_no"
+    if "p=2" in page2_url.lower().split("?")[-1]:
+        return "p"
+
+    # Check for offset
+    m = re.search(r'[?&](?:offset|start)=(\d+)', page2_url)
+    if m:
+        return f"offset={m.group(1)}"
+
+    # Check for /page/2 path pattern
+    if "/page/2" in page2_url:
+        return "path_page"
+
+    return None
+
+
+def construct_page_urls(base_url: str, pagination_info: dict) -> list[str]:
+    """Construct a list of all page URLs to scrape, including page 1.
+
+    Returns a list of URLs: [page1_url, page2_url, page3_url, ...]
+    Uses the pagination info from the validation task to construct URLs.
+    Falls back to common patterns if detection is unreliable.
+    """
+    total_pages = max(1, pagination_info.get("total_pages", 1))
+    page2_url = pagination_info.get("page_2_url", "")
+    pattern_str = pagination_info.get("pagination_url_pattern", "")
+
+    # Page 1 is always the base URL
+    urls = [base_url]
+
+    if total_pages <= 1:
+        return urls
+
+    # Detect the pattern from page_2_url or the reported pattern string
+    pattern = _detect_pattern_from_page2_url(base_url, page2_url)
+
+    if pattern is None and pattern_str:
+        # Try to infer from the pattern string
+        pattern_lower = pattern_str.lower()
+        if "page=n" in pattern_lower or "?page=" in pattern_lower:
+            pattern = "page"
+        elif "offset=" in pattern_lower:
+            pattern = "offset_from_pattern"
+        elif "/page/" in pattern_lower:
+            pattern = "path_page"
+        elif "pageno=" in pattern_lower:
+            pattern = "pageNo"
+        elif "p=" in pattern_lower:
+            pattern = "p"
+
+    # If we have a concrete page_2_url but couldn't detect the pattern,
+    # use the page_2_url directly for page 2 and try query param substitution for rest
+    if pattern is None and page2_url:
+        urls.append(page2_url)
+        # Try to construct subsequent pages by incrementing the number in page2_url
+        for pg in range(3, total_pages + 1):
+            # Replace "2" with pg in the last occurrence of "2" in query string
+            candidate = re.sub(r'(\d+)(?=[^/\d]*$)', str(pg), page2_url, count=1)
+            if candidate != page2_url:
+                urls.append(candidate)
+            else:
+                break
+        return urls
+
+    # Build URLs based on the detected pattern
+    parsed = urlparse(base_url)
+    lots_per_page = pagination_info.get("lots_per_page", 60) or 60
+
+    for pg in range(2, total_pages + 1):
+        if pattern == "page":
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            qs["page"] = [str(pg)]
+            new_query = urlencode(qs, doseq=True)
+            url = urlunparse(parsed._replace(query=new_query))
+        elif pattern == "pageNo":
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            qs["pageNo"] = [str(pg)]
+            new_query = urlencode(qs, doseq=True)
+            url = urlunparse(parsed._replace(query=new_query))
+        elif pattern == "page_no":
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            qs["page_no"] = [str(pg)]
+            new_query = urlencode(qs, doseq=True)
+            url = urlunparse(parsed._replace(query=new_query))
+        elif pattern == "p":
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            qs["p"] = [str(pg)]
+            new_query = urlencode(qs, doseq=True)
+            url = urlunparse(parsed._replace(query=new_query))
+        elif pattern and pattern.startswith("offset"):
+            offset = (pg - 1) * lots_per_page
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            qs["offset"] = [str(offset)]
+            new_query = urlencode(qs, doseq=True)
+            url = urlunparse(parsed._replace(query=new_query))
+        elif pattern == "path_page":
+            # /page/N pattern
+            path = parsed.path.rstrip("/")
+            # Remove existing /page/N if present
+            path = re.sub(r'/page/\d+', '', path)
+            url = urlunparse(parsed._replace(path=f"{path}/page/{pg}"))
+        else:
+            # Default fallback: try ?page=N
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            qs["page"] = [str(pg)]
+            new_query = urlencode(qs, doseq=True)
+            url = urlunparse(parsed._replace(query=new_query))
+
+        urls.append(url)
+
+    return urls
 
 
 def parse_extracted_lots(result) -> list[dict]:
@@ -1472,7 +1724,8 @@ if run_button:
 
     # ── Import crews ─────────────────────────────────────────────────────
     from fast_auction_research___speed_optimized.crew import (
-        ScreeningCrewPartA,
+        CatalogSetupCrew,
+        PageExtractionCrew,
         ScreeningCrewPartB,
         PerLotValidationCrew,
         PerLotDeepResearchCrew,
@@ -1528,20 +1781,110 @@ if run_button:
 
     try:
         # ═════════════════════════════════════════════════════════════════
-        # PHASE 1a — Catalog Extraction
+        # PHASE 1a — STEP 1: Catalog Setup (validation + buyer premium)
         # ═════════════════════════════════════════════════════════════════
-        tracker.set_phase("Phase 1a: Extracting Catalog", step="Scout scraping all lots...")
-        tracker.add_log("System", "Phase 1a: Starting catalog extraction")
+        tracker.set_phase("Phase 1a: Extracting Catalog", step="Validating auction URL & discovering buyer premium...")
+        tracker.add_log("System", "Phase 1a-setup: Validating URL and discovering buyer premium")
         _update_ui()
 
-        crew_1a = ScreeningCrewPartA().crew()
-        crew_1a.step_callback = make_step_callback(tracker)
-        crew_1a.task_callback = make_task_callback(tracker)
+        crew_setup = CatalogSetupCrew().crew()
+        crew_setup.step_callback = make_step_callback(tracker)
+        crew_setup.task_callback = make_task_callback(tracker)
 
-        result_1a = crew_1a.kickoff(inputs=inputs)
+        result_setup = crew_setup.kickoff(inputs=inputs)
 
-        all_lots = parse_lots_from_output(result_1a)
-        buyer_premium_data = extract_buyer_premium(result_1a)
+        buyer_premium_data = extract_buyer_premium(result_setup)
+
+        # Parse pagination info from the validation task output
+        validation_raw = ""
+        setup_task_outputs = getattr(result_setup, "tasks_output", None)
+        if setup_task_outputs and len(setup_task_outputs) >= 1:
+            validation_raw = getattr(setup_task_outputs[0], "raw", "")
+
+        pagination_info = _parse_pagination_info(validation_raw)
+        page_urls = construct_page_urls(inputs["auction_url"], pagination_info)
+
+        tracker.add_log("System",
+            f"Pagination detected: {pagination_info['pagination_detected']}, "
+            f"~{pagination_info['estimated_lots']} lots across ~{len(page_urls)} pages"
+        )
+        tracker.update_extraction(
+            extraction_total_pages=len(page_urls),
+        )
+        _update_ui()
+
+        # ═════════════════════════════════════════════════════════════════
+        # PHASE 1a — STEP 2: Per-Page Extraction (fresh crew per page)
+        # ═════════════════════════════════════════════════════════════════
+        tracker.add_log("System", f"Phase 1a-pages: Extracting lots from {len(page_urls)} page(s)")
+        all_lots: list[dict] = []
+        consecutive_empty = 0
+        MAX_CONSECUTIVE_EMPTY = 2  # stop after 2 empty pages in a row
+
+        for page_idx, page_url in enumerate(page_urls):
+            page_num = page_idx + 1
+            tracker.update_extraction(
+                extraction_current_page=f"Page {page_num}",
+                extraction_pages_scraped=page_num,
+            )
+            tracker.set_phase(
+                "Phase 1a: Extracting Catalog",
+                step=f"Scraping page {page_num} of {len(page_urls)}..."
+            )
+            tracker.add_log("Scout", f"Scraping page {page_num}: {page_url[:120]}")
+            _update_ui()
+
+            try:
+                crew_page = PageExtractionCrew().crew()
+                crew_page.step_callback = make_step_callback(tracker)
+                crew_page.task_callback = make_task_callback(tracker)
+
+                result_page = crew_page.kickoff(inputs={
+                    **inputs,
+                    "page_url": page_url,
+                })
+
+                page_lots = parse_lots_from_page_output(result_page)
+
+                if page_lots:
+                    all_lots.extend(page_lots)
+                    consecutive_empty = 0
+                    tracker.update_extraction(extraction_lots_found=len(all_lots))
+                    tracker.add_log("Scout",
+                        f"Page {page_num}: extracted {len(page_lots)} lots "
+                        f"(running total: {len(all_lots)})"
+                    )
+                else:
+                    consecutive_empty += 1
+                    tracker.add_log("Scout", f"Page {page_num}: 0 lots found")
+                    if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                        tracker.add_log("System",
+                            f"Stopping pagination: {MAX_CONSECUTIVE_EMPTY} consecutive empty pages"
+                        )
+                        break
+
+            except Exception as exc:
+                tracker.add_log("System", f"Page {page_num} extraction failed: {exc}")
+                consecutive_empty += 1
+                if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                    tracker.add_log("System",
+                        f"Stopping pagination after {MAX_CONSECUTIVE_EMPTY} consecutive failures"
+                    )
+                    break
+
+            _update_ui()
+
+        # Deduplicate lots by lot_number (in case pages overlap)
+        seen_lot_nums: set[str] = set()
+        deduped_lots: list[dict] = []
+        for lot in all_lots:
+            lot_num = str(lot.get("lot_number", ""))
+            if lot_num and lot_num in seen_lot_nums:
+                continue
+            if lot_num:
+                seen_lot_nums.add(lot_num)
+            deduped_lots.append(lot)
+        all_lots = deduped_lots
 
         tracker.total_catalog_lots = len(all_lots)
         tracker.add_log("System", f"Catalog extracted: {len(all_lots)} total lots")

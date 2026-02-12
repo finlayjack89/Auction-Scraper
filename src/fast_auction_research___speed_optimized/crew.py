@@ -1,8 +1,9 @@
 """
 Multi-crew architecture for Fast Auction Research.
 
-5 crew classes, each with its own token window:
-  - ScreeningCrewPartA: URL validation, buyer premium, catalog extraction
+6 crew classes, each with its own token window:
+  - CatalogSetupCrew: URL validation + buyer premium discovery (Phase 1a setup)
+  - PageExtractionCrew: Extract lots from ONE catalog page (called per-page)
   - ScreeningCrewPartB: Risk assessment + detail extraction (receives filtered lots)
   - PerLotValidationCrew: Market validation + profit calc for ONE lot
   - PerLotDeepResearchCrew: Deep research + profit analysis for ONE lot
@@ -23,12 +24,36 @@ from crewai_tools import (
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PHASE 1a — SCREENING CREW PART A
+# SHARED LLM CONFIGS — max output tokens set to model ceiling everywhere
+# ═══════════════════════════════════════════════════════════════════════════
+_GEMINI_MAX_TOKENS = 65536  # absolute max for gemini-3-flash/pro-preview
+
+def _flash(temperature: float = 0.3) -> LLM:
+    """Gemini 3 Flash with max output tokens."""
+    return LLM(
+        model="gemini/gemini-3-flash-preview",
+        temperature=temperature,
+        max_tokens=_GEMINI_MAX_TOKENS,
+    )
+
+def _pro(temperature: float = 0.5) -> LLM:
+    """Gemini 3 Pro with max output tokens."""
+    return LLM(
+        model="gemini/gemini-3-pro-preview",
+        temperature=temperature,
+        max_tokens=_GEMINI_MAX_TOKENS,
+    )
+
+_MAX_ITER = 100
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 1a — CATALOG SETUP CREW (validation + buyer premium only)
 # ═══════════════════════════════════════════════════════════════════════════
 
 @CrewBase
-class ScreeningCrewPartA:
-    """Extracts catalog + discovers buyer premium. Outputs ALL lots as JSON."""
+class CatalogSetupCrew:
+    """Validates the auction URL and discovers buyer premium. No lot extraction."""
     tasks_config = "config/tasks_1a.yaml"
 
     @agent
@@ -36,6 +61,7 @@ class ScreeningCrewPartA:
         return Agent(
             config=self.agents_config["scout___auction_navigator_keyword_filter"],
             tools=[
+                FirecrawlScrapeWebsiteTool(),
                 ScrapeWebsiteTool(),
                 SerperScrapeWebsiteTool(),
                 ScrapeElementFromWebsiteTool(),
@@ -43,8 +69,8 @@ class ScreeningCrewPartA:
             reasoning=False,
             inject_date=True,
             allow_delegation=False,
-            max_iter=25,
-            llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.4),
+            max_iter=_MAX_ITER,
+            llm=_flash(temperature=0.4),
         )
 
     @task
@@ -61,10 +87,47 @@ class ScreeningCrewPartA:
             markdown=False,
         )
 
+    @crew
+    def crew(self) -> Crew:
+        return Crew(
+            agents=self.agents,
+            tasks=self.tasks,
+            process=Process.sequential,
+            verbose=True,
+            chat_llm=_flash(),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 1a — PER-PAGE EXTRACTION CREW (one page at a time)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@CrewBase
+class PageExtractionCrew:
+    """Extracts lots from a SINGLE catalog page. Called once per page."""
+    tasks_config = "config/tasks_1a.yaml"
+
+    @agent
+    def scout___auction_navigator_keyword_filter(self) -> Agent:
+        return Agent(
+            config=self.agents_config["scout___auction_navigator_keyword_filter"],
+            tools=[
+                FirecrawlScrapeWebsiteTool(),
+                ScrapeWebsiteTool(),
+                SerperScrapeWebsiteTool(),
+                ScrapeElementFromWebsiteTool(),
+            ],
+            reasoning=False,
+            inject_date=True,
+            allow_delegation=False,
+            max_iter=_MAX_ITER,
+            llm=_flash(temperature=0.4),
+        )
+
     @task
-    def scout_auction_catalog(self) -> Task:
+    def extract_single_page(self) -> Task:
         return Task(
-            config=self.tasks_config["scout_auction_catalog"],
+            config=self.tasks_config["extract_single_page"],
             markdown=False,
         )
 
@@ -75,7 +138,7 @@ class ScreeningCrewPartA:
             tasks=self.tasks,
             process=Process.sequential,
             verbose=True,
-            chat_llm=LLM(model="gemini/gemini-3-flash-preview"),
+            chat_llm=_flash(),
         )
 
 
@@ -96,8 +159,8 @@ class ScreeningCrewPartB:
             reasoning=False,
             inject_date=True,
             allow_delegation=False,
-            max_iter=25,
-            llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.1),
+            max_iter=_MAX_ITER,
+            llm=_flash(temperature=0.1),
         )
 
     @agent
@@ -108,8 +171,8 @@ class ScreeningCrewPartB:
             reasoning=False,
             inject_date=True,
             allow_delegation=False,
-            max_iter=25,
-            llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.1),
+            max_iter=_MAX_ITER,
+            llm=_flash(temperature=0.1),
         )
 
     @task
@@ -133,7 +196,7 @@ class ScreeningCrewPartB:
             tasks=self.tasks,
             process=Process.sequential,
             verbose=True,
-            chat_llm=LLM(model="gemini/gemini-3-flash-preview"),
+            chat_llm=_flash(),
         )
 
 
@@ -154,8 +217,8 @@ class PerLotValidationCrew:
             reasoning=False,
             inject_date=True,
             allow_delegation=False,
-            max_iter=12,
-            llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.15),
+            max_iter=40,  # tighter — this is a rapid screening agent
+            llm=_flash(temperature=0.15),
         )
 
     @agent
@@ -166,8 +229,8 @@ class PerLotValidationCrew:
             reasoning=False,
             inject_date=True,
             allow_delegation=False,
-            max_iter=25,
-            llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.1),
+            max_iter=_MAX_ITER,
+            llm=_flash(temperature=0.1),
         )
 
     @task
@@ -191,7 +254,7 @@ class PerLotValidationCrew:
             tasks=self.tasks,
             process=Process.sequential,
             verbose=True,
-            chat_llm=LLM(model="gemini/gemini-3-flash-preview"),
+            chat_llm=_flash(),
         )
 
 
@@ -212,8 +275,8 @@ class PerLotDeepResearchCrew:
             reasoning=False,
             inject_date=True,
             allow_delegation=False,
-            max_iter=25,
-            llm=LLM(model="gemini/gemini-3-pro-preview", temperature=0.5),
+            max_iter=_MAX_ITER,
+            llm=_pro(temperature=0.5),
         )
 
     @agent
@@ -224,8 +287,8 @@ class PerLotDeepResearchCrew:
             reasoning=False,
             inject_date=True,
             allow_delegation=False,
-            max_iter=25,
-            llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.1),
+            max_iter=_MAX_ITER,
+            llm=_flash(temperature=0.1),
         )
 
     @task
@@ -249,7 +312,7 @@ class PerLotDeepResearchCrew:
             tasks=self.tasks,
             process=Process.sequential,
             verbose=True,
-            chat_llm=LLM(model="gemini/gemini-3-flash-preview"),
+            chat_llm=_flash(),
         )
 
 
@@ -270,8 +333,8 @@ class SynthesisCrew:
             reasoning=False,
             inject_date=True,
             allow_delegation=False,
-            max_iter=25,
-            llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.1),
+            max_iter=_MAX_ITER,
+            llm=_flash(temperature=0.1),
         )
 
     @agent
@@ -282,9 +345,9 @@ class SynthesisCrew:
             reasoning=False,
             inject_date=True,
             allow_delegation=False,
-            max_iter=25,
+            max_iter=_MAX_ITER,
             apps=["box/save_file_from_object"],
-            llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.3),
+            llm=_flash(temperature=0.3),
         )
 
     @agent
@@ -295,9 +358,9 @@ class SynthesisCrew:
             reasoning=False,
             inject_date=True,
             allow_delegation=False,
-            max_iter=25,
+            max_iter=_MAX_ITER,
             apps=["box/save_file_from_object"],
-            llm=LLM(model="gemini/gemini-3-flash-preview", temperature=0.3),
+            llm=_flash(temperature=0.3),
         )
 
     @task
@@ -328,5 +391,5 @@ class SynthesisCrew:
             tasks=self.tasks,
             process=Process.sequential,
             verbose=True,
-            chat_llm=LLM(model="gemini/gemini-3-flash-preview"),
+            chat_llm=_flash(),
         )
