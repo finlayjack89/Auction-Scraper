@@ -105,7 +105,7 @@ class CatalogSetupCrew:
 @CrewBase
 class PageExtractionCrew:
     """Extracts lots from a SINGLE catalog page. Called once per page."""
-    tasks_config = "config/tasks_1a.yaml"
+    tasks_config = "config/tasks_page_extraction.yaml"
 
     @agent
     def scout___auction_navigator_keyword_filter(self) -> Agent:

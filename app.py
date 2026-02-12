@@ -1780,6 +1780,18 @@ if run_button:
 
     start_time = time.time()
 
+    # #region agent log — CANARY: confirm instrumented code is running
+    _DBG_LOG_PATH = os.path.join(_PROJECT_ROOT, ".cursor", "debug.log")
+    os.makedirs(os.path.dirname(_DBG_LOG_PATH), exist_ok=True)
+    def _dbg(msg, data, hyp="X"):
+        try:
+            with open(_DBG_LOG_PATH, "a") as _f:
+                _f.write(json.dumps({"timestamp": int(time.time()*1000), "location": "app.py", "message": msg, "data": data, "hypothesisId": hyp}) + "\n")
+        except Exception:
+            pass
+    _dbg("CANARY_workflow_start", {"auction_url": inputs.get("auction_url", "")[:100], "phrases": phrases}, "CANARY")
+    # #endregion
+
     try:
         # ═════════════════════════════════════════════════════════════════
         # PHASE 1a — STEP 1: Catalog Setup (validation + buyer premium)
@@ -1794,6 +1806,15 @@ if run_button:
 
         result_setup = crew_setup.kickoff(inputs=inputs)
 
+        # #region agent log — Hypothesis E: CatalogSetupCrew output
+        _dbg("setup_crew_result_type", {"type": str(type(result_setup)), "has_raw": hasattr(result_setup, "raw"), "raw_len": len(getattr(result_setup, "raw", "")), "raw_first_500": getattr(result_setup, "raw", "")[:500]}, "E")
+        _setup_tasks = getattr(result_setup, "tasks_output", None)
+        _dbg("setup_tasks_output", {"count": len(_setup_tasks) if _setup_tasks else 0, "task_names": [getattr(t, "name", getattr(t, "description", "?"))[:80] for t in (_setup_tasks or [])]}, "E")
+        if _setup_tasks:
+            for _i, _t in enumerate(_setup_tasks):
+                _dbg(f"setup_task_{_i}_raw", {"raw_len": len(getattr(_t, "raw", "")), "raw_first_800": getattr(_t, "raw", "")[:800]}, "E")
+        # #endregion
+
         buyer_premium_data = extract_buyer_premium(result_setup)
 
         # Parse pagination info from the validation task output
@@ -1804,6 +1825,12 @@ if run_button:
 
         pagination_info = _parse_pagination_info(validation_raw)
         page_urls = construct_page_urls(inputs["auction_url"], pagination_info)
+
+        # #region agent log — Hypothesis A: Pagination parsing
+        _dbg("validation_raw_length", {"len": len(validation_raw), "first_600": validation_raw[:600]}, "A")
+        _dbg("pagination_info_parsed", {"info": pagination_info}, "A")
+        _dbg("page_urls_constructed", {"count": len(page_urls), "urls": page_urls[:10]}, "A")
+        # #endregion
 
         tracker.add_log("System",
             f"Pagination detected: {pagination_info['pagination_detected']}, "
@@ -1853,17 +1880,36 @@ if run_button:
                 )
 
                 try:
+                    # #region agent log — Hypothesis B: crew task list
                     crew_page = PageExtractionCrew().crew()
+                    _dbg(f"page_{page_num}_crew_tasks", {"task_count": len(crew_page.tasks), "task_names": [getattr(t, "name", getattr(t, "description", "?"))[:80] for t in crew_page.tasks], "agent_count": len(crew_page.agents)}, "B")
+                    # #endregion
                     crew_page.step_callback = make_step_callback(tracker)
                     crew_page.task_callback = make_task_callback(tracker)
 
+                    # #region agent log — Hypothesis C: akickoff execution
+                    _dbg(f"page_{page_num}_akickoff_start", {"page_num": page_num, "page_url": page_url[:150]}, "C")
+                    # #endregion
                     # akickoff = native async CrewAI execution
                     result_page = await crew_page.akickoff(inputs={
                         **inputs,
                         "page_url": page_url,
                     })
 
+                    # #region agent log — Hypothesis C+D: result inspection
+                    _dbg(f"page_{page_num}_akickoff_result", {"type": str(type(result_page)), "has_raw": hasattr(result_page, "raw"), "raw_len": len(getattr(result_page, "raw", "")), "raw_first_500": getattr(result_page, "raw", "")[:500]}, "CD")
+                    _pg_tasks = getattr(result_page, "tasks_output", None)
+                    _dbg(f"page_{page_num}_tasks_output", {"count": len(_pg_tasks) if _pg_tasks else 0}, "CD")
+                    if _pg_tasks:
+                        for _pi, _pt in enumerate(_pg_tasks):
+                            _dbg(f"page_{page_num}_task_{_pi}_raw", {"raw_len": len(getattr(_pt, "raw", "")), "raw_first_500": getattr(_pt, "raw", "")[:500]}, "CD")
+                    # #endregion
+
                     page_lots = parse_lots_from_page_output(result_page)
+
+                    # #region agent log — Hypothesis D: parse result
+                    _dbg(f"page_{page_num}_parsed_lots", {"count": len(page_lots), "first_2": page_lots[:2] if page_lots else []}, "D")
+                    # #endregion
 
                     if page_lots:
                         page_results[page_num] = page_lots
@@ -1879,6 +1925,10 @@ if run_button:
                         tracker.add_log("Scout", f"Page {page_num}: 0 lots found")
 
                 except Exception as exc:
+                    # #region agent log — Hypothesis C: exception details
+                    import traceback as _tb
+                    _dbg(f"page_{page_num}_exception", {"page_num": page_num, "error": str(exc), "traceback": _tb.format_exc()}, "C")
+                    # #endregion
                     page_results[page_num] = []
                     tracker.add_log("System", f"Page {page_num} extraction failed: {exc}")
 
@@ -1894,7 +1944,16 @@ if run_button:
         # Run the async extraction — Streamlit runs sync, so use asyncio.run()
         # in a thread to avoid event-loop conflicts with Streamlit's own loop.
         def _run_async_extraction():
-            asyncio.run(_extract_all_pages())
+            try:
+                asyncio.run(_extract_all_pages())
+                # #region agent log — thread completion
+                _dbg("async_extraction_complete", {"page_results_keys": list(page_results.keys()), "total_lots": sum(len(v) for v in page_results.values())}, "C")
+                # #endregion
+            except Exception as _thr_exc:
+                # #region agent log — thread-level error
+                import traceback as _tb2
+                _dbg("async_thread_exception", {"error": str(_thr_exc), "traceback": _tb2.format_exc()}, "C")
+                # #endregion
 
         extraction_thread = threading.Thread(target=_run_async_extraction, daemon=True)
         extraction_thread.start()
@@ -1927,6 +1986,10 @@ if run_button:
 
         tracker.total_catalog_lots = len(all_lots)
         tracker.add_log("System", f"Catalog extracted: {len(all_lots)} total lots")
+
+        # #region agent log — final lot count before keyword filter
+        _dbg("all_lots_final", {"count": len(all_lots), "first_3": all_lots[:3] if all_lots else [], "page_results_summary": {str(k): len(v) for k, v in page_results.items()}}, "FINAL")
+        # #endregion
 
         # ═════════════════════════════════════════════════════════════════
         # PYTHON KEYWORD FILTER (deterministic)
@@ -2148,6 +2211,10 @@ if run_button:
         tracker.add_log("System", "Workflow complete!")
 
     except Exception as exc:
+        # #region agent log — outer exception
+        import traceback as _tb3
+        _dbg("OUTER_EXCEPTION", {"error": str(exc), "type": str(type(exc)), "traceback": _tb3.format_exc()}, "OUTER")
+        # #endregion
         tracker.finished = True
         tracker.error = exc
         tracker.add_log("System", f"Workflow failed: {exc}")

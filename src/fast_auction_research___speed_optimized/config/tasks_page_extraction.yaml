@@ -1,0 +1,39 @@
+---
+extract_single_page:
+  description: |-
+    **SINGLE PAGE EXTRACTION** — Scrape exactly ONE catalog page and output all lots found on it as a JSON array. Do NOT navigate to other pages. Do NOT filter lots.
+
+    **PAGE TO SCRAPE:** {page_url}
+
+    **INSTRUCTIONS:**
+    1. Use FirecrawlScrapeWebsiteTool to scrape the page at {page_url}
+    2. If Firecrawl returns incomplete content, fall back to ScrapeWebsiteTool
+    3. Parse every lot visible on THIS page into a JSON object
+    4. Output the lots as a JSON array — do NOT try to navigate to other pages
+
+    **OUTPUT FORMAT — MANDATORY:**
+    Output a JSON array inside a ```json code fence. Include ONLY the lots on THIS page.
+    Each lot object MUST have these fields:
+    - "lot_number": string (the lot number)
+    - "title": string (the full lot title as listed)
+    - "estimate_low": number or null (low estimate in GBP, no currency symbol)
+    - "estimate_high": number or null (high estimate in GBP, no currency symbol)
+    - "description": string (any additional description text, or empty string)
+
+    **EXAMPLE OUTPUT:**
+    ```json
+    [
+      {"lot_number": "1", "title": "A Cartier Santos wristwatch", "estimate_low": 800, "estimate_high": 1200, "description": "Steel case, blue dial, box and papers"},
+      {"lot_number": "2", "title": "Victorian mahogany table", "estimate_low": 200, "estimate_high": 400, "description": ""}
+    ]
+    ```
+
+    **CRITICAL RULES:**
+    - Output ALL lots on THIS page — do NOT skip any, do NOT filter
+    - Do NOT navigate to other pages — only scrape {page_url}
+    - If you cannot parse estimates, use null
+    - Always use a ```json code fence around the array
+  expected_output: "A JSON array of all lots found on this single page, inside a ```json
+    code fence. Each lot has: lot_number, title, estimate_low, estimate_high, description.
+    After the JSON, state: LOTS ON THIS PAGE: [number]."
+  agent: scout___auction_navigator_keyword_filter
